@@ -300,5 +300,5 @@ class AuditLog(Base):
     entity_id     = Column(String, nullable=True)
     amount        = Column(Float, nullable=True)
     ip_address    = Column(String, nullable=True)
-    metadata      = Column(JSON, nullable=True)
+    event_metadata = Column("metadata", JSON, nullable=True)
     created_at    = Column(DateTime, default=datetime.utcnow)

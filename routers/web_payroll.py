@@ -132,7 +132,7 @@ async def _log(db: AsyncSession, phone: str, action: str, entity_type: str = Non
     ip = request.client.host if request else None
     log = AuditLog(
         actor_phone=phone, action=action, entity_type=entity_type,
-        entity_id=entity_id, amount=amount, ip_address=ip, metadata=meta,
+        entity_id=entity_id, amount=amount, ip_address=ip, event_metadata=meta,
     )
     db.add(log)
 
