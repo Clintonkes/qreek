@@ -7,7 +7,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from jose import jwt, JWTError
 from sqlalchemy import select, desc, func
 from database.session import AsyncSessionLocal
-from database.models import User, Transaction, PriceAlert, Pool, PoolMember, Referral
+from database.models import User, Transaction, PriceAlert, Pool, PoolMember, Referral, FiatPool, FiatPoolMember, PoolTransaction
+from core.banks import resolve_bank
 from core.session import (
     get_state, set_state, save_pending, get_pending, clear_pending,
     increment_fail, reset_fail, State,
@@ -308,6 +309,43 @@ async def _refer(ws: WebSocket, phone: str):
     ))
 
 
+async def _ngn_send(ws: WebSocket, phone: str, intent: dict):
+    """Send NGN to any bank account — pool-facilitated, 0.3% fee, pass-through."""
+    amount    = intent.get("amount")
+    recipient = intent.get("recipient")
+
+    if not amount or amount <= 0:
+        await ws.send_text(_out(
+            "How much NGN to send?\nExample: send ₦5000 to GTBank 0123456789",
+            "idle"
+        ))
+        return
+    if amount < 100:
+        await ws.send_text(_out("Minimum NGN send is ₦100.", "idle"))
+        return
+
+    fee = round(amount * 0.003, 2)
+    net = round(amount - fee, 2)
+
+    # Find any fiat pool the user is in to apply pool pricing
+    async with AsyncSessionLocal() as db:
+        pr = await db.execute(select(FiatPoolMember).where(FiatPoolMember.user_phone == phone))
+        membership = pr.scalar_one_or_none()
+
+    msg = (
+        f"💳 Send ₦\n{'─' * 30}\n"
+        f"Amount:  {_ngn(amount)}\n"
+        f"Fee (0.3%): {_ngn(fee)}\n"
+        f"Recipient gets: {_ngn(net)}\n\n"
+        f"Reply with bank details:\n"
+        f"account_number bank_code  recipient_name\n"
+        f"Example: 0123456789 058 Emeka Johnson"
+    )
+    await save_pending(phone, "ngn_send", {"amount": amount, "fee": fee, "net": net})
+    await set_state(phone, "await_ngn_send_account")
+    await ws.send_text(_out(msg, "awaiting_account", {"amount": amount, "fee": fee, "net": net}))
+
+
 def _help() -> str:
     return (
         "👋 *Qreek Finance Commands*\n"
@@ -315,6 +353,7 @@ def _help() -> str:
         "💸 sell 100 USDT\n"
         "🛒 buy 50 USDT\n"
         "📤 send 20 USDT to 08012345678\n"
+        "💳 send ₦5000 to GTBank 0123456789\n"
         "📊 market  —  live rates\n"
         "💼 portfolio\n"
         "📋 history\n"
@@ -543,6 +582,110 @@ async def _handle_pending(ws: WebSocket, phone: str, state: str, text: str) -> b
         ))
         return True
 
+    # ── NGN SEND — collect bank details ──────────────────────────────────────
+    if state == "await_ngn_send_account":
+        parts = t.split()
+        if len(parts) < 3 or not re.match(r"^\d{10}$", parts[0]):
+            await ws.send_text(_out(
+                "Format: account_number bank_code Recipient Name\n"
+                "Example: 0123456789 058 Emeka Johnson",
+                "awaiting_account"
+            ))
+            return True
+
+        account   = parts[0]
+        bank_code = parts[1]
+        rec_name  = " ".join(parts[2:])
+        bank      = resolve_bank(bank_code)
+        bank_name = bank["name"] if bank else bank_code
+
+        pending   = await get_pending(phone, "ngn_send")
+        if not pending:
+            await set_state(phone, State.VERIFIED)
+            await ws.send_text(_out("Session expired. Please start again.", "idle"))
+            return True
+
+        pending.update({"bank_account": account, "bank_code": bank_code, "bank_name": bank_name, "recipient_name": rec_name})
+        await save_pending(phone, "ngn_send", pending)
+        await set_state(phone, "await_ngn_send_confirm")
+
+        await ws.send_text(_out(
+            f"✅ Confirm NGN Payment\n{'─' * 30}\n"
+            f"To:      {rec_name}\n"
+            f"Bank:    {bank_name}  ****{account[-4:]}\n"
+            f"Amount:  {_ngn(pending['amount'])}\n"
+            f"Fee (0.3%): {_ngn(pending['fee'])}\n"
+            f"They receive: {_ngn(pending['net'])}\n\n"
+            f"Type YES to confirm or CANCEL to abort.",
+            "confirm", pending,
+        ))
+        return True
+
+    if state == "await_ngn_send_confirm":
+        if t.upper() not in ("YES", "Y", "CONFIRM", "OK"):
+            await ws.send_text(_out("Type YES to confirm or CANCEL to abort.", "confirm"))
+            return True
+        await set_state(phone, "await_ngn_send_pin")
+        await ws.send_text(_out("🔐 Enter your PIN to send.", "pin"))
+        return True
+
+    if state == "await_ngn_send_pin":
+        if not re.match(r"^\d{4,6}$", t):
+            await ws.send_text(_out("Enter your 4–6 digit PIN.", "pin"))
+            return True
+
+        async with AsyncSessionLocal() as db:
+            if await is_frozen(db, phone):
+                await ws.send_text(_out("🚫 Account frozen. Contact support.", "frozen"))
+                return True
+            ok = await verify_pin(db, phone, t)
+            if not ok:
+                fails = await increment_fail(phone)
+                if fails >= 5:
+                    await freeze_account(db, phone)
+                    await set_state(phone, State.FROZEN)
+                    await ws.send_text(_out("🚫 Account frozen.", "frozen"))
+                    return True
+                await ws.send_text(_out(f"❌ Wrong PIN. {5 - fails} remaining.", "pin"))
+                return True
+            await reset_fail(phone)
+
+        pending = await get_pending(phone, "ngn_send")
+        if not pending:
+            await set_state(phone, State.VERIFIED)
+            await ws.send_text(_out("Session expired. Please start again.", "idle"))
+            return True
+
+        ref  = "QRK_NGN_" + uuid.uuid4().hex[:8].upper()
+        bank = {"account_number": pending["bank_account"], "bank_code": pending["bank_code"]}
+        asyncio.create_task(best_payout(phone, pending["net"], bank, ref))
+
+        async with AsyncSessionLocal() as db:
+            db.add(Transaction(
+                user_phone=phone, tx_type="fiat_send",
+                currency="NGN", amount=pending["amount"],
+                ngn_amount=pending["amount"],
+                fee=pending["fee"], fee_pct=0.003,
+                status="processing", reference=ref,
+                bank_account=pending["bank_account"],
+                bank_code=pending["bank_code"],
+                bank_name=pending["bank_name"],
+            ))
+            await db.commit()
+
+        await clear_pending(phone, "ngn_send")
+        await set_state(phone, State.VERIFIED)
+        await ws.send_text(_out(
+            f"🎉 Payment sent!\n{'─' * 30}\n"
+            f"To:     {pending['recipient_name']}\n"
+            f"Bank:   {pending['bank_name']}  ****{pending['bank_account'][-4:]}\n"
+            f"Amount: {_ngn(pending['net'])}\n"
+            f"Ref:    {ref}\n\n"
+            f"Arrives in under 5 minutes.",
+            "done", {"reference": ref},
+        ))
+        return True
+
     return False
 
 
@@ -607,6 +750,8 @@ async def trade_ws(websocket: WebSocket):
                 await _buy(websocket, phone, intent)
             elif action in ("send_crypto", "send"):
                 await _send(websocket, phone, intent)
+            elif action in ("individual_send", "fiat_send"):
+                await _ngn_send(websocket, phone, intent)
             elif action in ("market", "rate"):
                 await websocket.send_text(_out(await market_message(), "idle"))
             elif action in ("portfolio", "balance"):

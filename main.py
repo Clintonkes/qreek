@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database.session import init_db
-from routers import web_auth, web_rates, web_wallet, web_pools, web_alerts, web_ws
+from routers import web_auth, web_rates, web_wallet, web_pools, web_alerts, web_ws, web_payroll, web_payment_links
 import os
 
 
@@ -33,6 +33,8 @@ app.include_router(web_rates.router)
 app.include_router(web_wallet.router)
 app.include_router(web_pools.router)
 app.include_router(web_alerts.router)
+app.include_router(web_payroll.router)
+app.include_router(web_payment_links.router)
 app.include_router(web_ws.router)
 
 
