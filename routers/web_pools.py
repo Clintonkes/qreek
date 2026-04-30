@@ -115,18 +115,22 @@ async def join_pool(
         fpr   = await db.execute(select(FiatPool).where(FiatPool.invite_code == code))
         fpool = fpr.scalar_one_or_none()
         if not fpool:
-            raise HTTPException(status_code=404, detail="Invalid invite code")
+            raise HTTPException(status_code=404, detail="Invalid invite code. Check the code and try again.")
+        if fpool.creator_phone == phone:
+            raise HTTPException(status_code=400, detail="You created this pool — you're already the admin.")
         ex = await db.execute(select(FiatPoolMember).where(FiatPoolMember.pool_id == fpool.id, FiatPoolMember.user_phone == phone))
         if ex.scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="Already a member of this pool")
+            raise HTTPException(status_code=400, detail="You're already a member of this pool.")
         fpool.member_count = (fpool.member_count or 1) + 1
         db.add(FiatPoolMember(pool_id=fpool.id, user_phone=phone, role="member"))
         await db.commit()
-        return {"message": f"Joined fiat pool '{fpool.name}'", "pool_id": fpool.id}
+        return {"message": f"Joined fiat pool '{fpool.name}'", "pool_id": fpool.id, "pool_type": "fiat"}
 
+    if pool.creator_phone == phone:
+        raise HTTPException(status_code=400, detail="You created this pool — you're already the admin.")
     ex = await db.execute(select(PoolMember).where(PoolMember.pool_id == pool.id, PoolMember.user_phone == phone))
     if ex.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Already a member of this pool")
+        raise HTTPException(status_code=400, detail="You're already a member of this pool.")
     pool.member_count = (pool.member_count or 1) + 1
     db.add(PoolMember(pool_id=pool.id, user_phone=phone, role="member"))
     await db.commit()
