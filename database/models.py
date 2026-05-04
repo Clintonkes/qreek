@@ -44,6 +44,21 @@ class UserSecurity(Base):
     last_active          = Column(DateTime, default=datetime.utcnow)
 
 
+class WebSession(Base):
+    __tablename__             = "web_sessions"
+    id                        = Column(String, primary_key=True, default=lambda: "sess_" + uuid.uuid4().hex)
+    user_phone                = Column(String, ForeignKey("users.phone"), nullable=False)
+    refresh_token_hash        = Column(String, nullable=False, unique=True)
+    current_access_jti        = Column(String, nullable=False)
+    user_agent                = Column(String, nullable=True)
+    ip_address                = Column(String, nullable=True)
+    is_revoked                = Column(Boolean, default=False)
+    revoked_at                = Column(DateTime, nullable=True)
+    last_activity_at          = Column(DateTime, default=datetime.utcnow)
+    expires_at                = Column(DateTime, nullable=False)
+    created_at                = Column(DateTime, default=datetime.utcnow)
+
+
 class Transaction(Base):
     __tablename__   = "transactions"
     id              = Column(String, primary_key=True, default=lambda: "tx_" + uuid.uuid4().hex[:12])

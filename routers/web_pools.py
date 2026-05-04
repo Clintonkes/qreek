@@ -9,8 +9,9 @@ from database.session import get_db
 from database.models import Pool, PoolMember, FiatPool, FiatPoolMember, PoolTransaction, PaymentRequest, User
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
-from core.payout import best_payout
-from services.security_service import verify_pin
+from core.payout import best_payout, settle_fee
+from services.payment_service import debit_ngn_or_reject, refund_ngn
+from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin
 
 router = APIRouter(prefix="/api/v1/pools", tags=["pools"])
 
@@ -220,13 +221,21 @@ async def pool_send(
     if not bank:
         raise HTTPException(status_code=400, detail=f"Invalid bank code: {body.bank_code}")
 
-    ok = await verify_pin(db, phone, body.pin)
+    if await is_frozen(db, phone):
+        raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
+
+    ok = await verify_transaction_pin(db, phone, body.pin)
     if not ok:
-        raise HTTPException(status_code=401, detail="Incorrect PIN.")
+        remaining = await pin_attempts_remaining(db, phone)
+        if remaining <= 0:
+            raise HTTPException(status_code=403, detail="Account frozen after 5 failed PIN attempts.")
+        raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
 
     fee = round(body.amount * FEE_POOL_NGN, 2)
     net = round(body.amount - fee, 2)
     ref = "QRK_PS_" + uuid.uuid4().hex[:10].upper()
+
+    await debit_ngn_or_reject(db, phone, body.amount)
 
     txn = PoolTransaction(
         pool_id=pool_id,
@@ -250,7 +259,7 @@ async def pool_send(
     await db.refresh(txn)
 
     bank_dict = {"account_number": body.bank_account, "bank_code": body.bank_code}
-    asyncio.create_task(_fire_pool_payout(txn.id, phone, net, bank_dict, ref))
+    asyncio.create_task(_fire_pool_payout(txn.id, phone, net, fee, bank_dict, ref))
 
     return {
         "message": f"Payment of ₦{body.amount:,.2f} to {body.recipient_name} is processing.",
@@ -259,10 +268,11 @@ async def pool_send(
     }
 
 
-async def _fire_pool_payout(txn_id: str, phone: str, net: float, bank: dict, ref: str):
+async def _fire_pool_payout(txn_id: str, phone: str, net: float, fee: float, bank: dict, ref: str):
     from database.session import AsyncSessionLocal
     try:
         result = await best_payout(phone, net, bank, ref)
+        await settle_fee(phone, fee, ref)
         async with AsyncSessionLocal() as db:
             r   = await db.execute(select(PoolTransaction).where(PoolTransaction.id == txn_id))
             txn = r.scalar_one_or_none()
@@ -277,6 +287,7 @@ async def _fire_pool_payout(txn_id: str, phone: str, net: float, bank: dict, ref
             txn = r.scalar_one_or_none()
             if txn:
                 txn.status = "failed"
+                await refund_ngn(db, phone, txn.amount)
                 await db.commit()
 
 

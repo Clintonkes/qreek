@@ -17,6 +17,7 @@ from core.ai_parser import parse_intent
 from core.rate_engine import get_rate, get_all_rates, market_message
 from core.payout import best_payout, get_virtual_account
 from services.security_service import verify_pin, freeze_account, is_frozen
+from core.web_jwt import decode_token_string
 
 SECRET = os.getenv("JWT_SECRET", "qreek-change-this-in-production-use-openssl-rand-hex-32")
 ALGO   = "HS256"
@@ -696,14 +697,13 @@ async def trade_ws(websocket: WebSocket):
     token = websocket.query_params.get("token")
     phone = None
 
-    try:
-        payload = jwt.decode(token, SECRET, algorithms=[ALGO])
-        phone   = payload.get("phone")
-        if not phone:
-            raise ValueError("no phone")
-    except Exception:
-        await websocket.close(code=4001)
-        return
+    async with AsyncSessionLocal() as db:
+        try:
+            payload = await decode_token_string(token, db)
+            phone = payload.get("phone")
+        except Exception:
+            await websocket.close(code=4001)
+            return
 
     await websocket.accept()
 

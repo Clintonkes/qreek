@@ -14,13 +14,14 @@ from database.session import get_db
 from database.models import PaymentLink, User, PoolTransaction
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
-from core.payout import best_payout
-from services.security_service import verify_pin
+from core.payout import best_payout, settle_fee
+from services.payment_service import debit_ngn_or_reject, refund_ngn
+from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin
 import asyncio
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
-FEE_PCT = 0.003
+FEE_PCT = 0.004
 
 
 class CreateLinkIn(BaseModel):
@@ -142,16 +143,23 @@ async def pay_link(
     if not amount or amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount.")
 
-    ok = await verify_pin(db, payer_phone, body.pin)
+    if await is_frozen(db, payer_phone):
+        raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
+
+    ok = await verify_transaction_pin(db, payer_phone, body.pin)
     if not ok:
-        raise HTTPException(status_code=401, detail="Incorrect PIN.")
+        remaining = await pin_attempts_remaining(db, payer_phone)
+        if remaining <= 0:
+            raise HTTPException(status_code=403, detail="Account frozen after 5 failed PIN attempts.")
+        raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
 
     fee = round(amount * FEE_PCT, 2)
     net = round(amount - fee, 2)
     ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
 
-    bank   = {"account_number": link.bank_account, "bank_code": link.bank_code}
-    asyncio.create_task(best_payout(payer_phone, net, bank, ref))
+    await debit_ngn_or_reject(db, payer_phone, amount)
+    bank = {"account_number": link.bank_account, "bank_code": link.bank_code}
+    asyncio.create_task(_fire_link_payout(payer_phone, amount, net, fee, bank, ref))
 
     link.use_count      = (link.use_count or 0) + 1
     link.total_collected = (link.total_collected or 0) + amount
@@ -163,6 +171,17 @@ async def pay_link(
         "fee": fee,
         "net": net,
     }
+
+
+async def _fire_link_payout(payer_phone: str, gross: float, net: float, fee: float, bank: dict, ref: str):
+    from database.session import AsyncSessionLocal
+    try:
+        await best_payout(payer_phone, net, bank, ref)
+        await settle_fee(payer_phone, fee, ref)
+    except Exception:
+        async with AsyncSessionLocal() as db:
+            await refund_ngn(db, payer_phone, gross)
+            await db.commit()
 
 
 @router.delete("/{link_id}")

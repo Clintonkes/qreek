@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -6,7 +6,7 @@ from database.session import get_db
 from database.models import User
 from services.user_service import get_or_create_user, save_bank, apply_referral
 from services.security_service import set_pin, verify_pin, freeze_account, is_frozen
-from core.web_jwt import create_token, decode_token
+from core.web_jwt import decode_token, issue_session_tokens, refresh_session_tokens, revoke_all_sessions, revoke_session
 from core.banks import BANKS, resolve_bank
 from core.session import set_state, State
 import redis.asyncio as aioredis
@@ -81,8 +81,12 @@ class SaveBankBody(BaseModel):
     bank_code:      str
 
 
+class RefreshBody(BaseModel):
+    refresh_token: str
+
+
 @router.post("/register")
-async def register(body: RegisterBody, db: AsyncSession = Depends(get_db)):
+async def register(body: RegisterBody, request: Request, db: AsyncSession = Depends(get_db)):
     phone = normalise_phone(body.phone)
 
     result   = await db.execute(select(User).where(User.phone == phone))
@@ -106,12 +110,13 @@ async def register(body: RegisterBody, db: AsyncSession = Depends(get_db)):
 
     await set_state(phone, State.VERIFIED)
 
-    token = create_token({"phone": phone})
-    return {"token": token, "user": user_to_dict(user)}
+    tokens = await issue_session_tokens(db, phone, request)
+    await db.commit()
+    return {**tokens, "user": user_to_dict(user)}
 
 
 @router.post("/login")
-async def login(body: LoginBody, db: AsyncSession = Depends(get_db)):
+async def login(body: LoginBody, request: Request, db: AsyncSession = Depends(get_db)):
     phone  = normalise_phone(body.phone)
     result = await db.execute(select(User).where(User.phone == phone))
     user   = result.scalar_one_or_none()
@@ -135,8 +140,26 @@ async def login(body: LoginBody, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=401, detail=f"Incorrect PIN. {5 - int(fails)} attempts remaining.")
 
     await r.delete(fail_key)
-    token = create_token({"phone": phone})
-    return {"token": token, "user": user_to_dict(user)}
+    tokens = await issue_session_tokens(db, phone, request)
+    await db.commit()
+    return {**tokens, "user": user_to_dict(user)}
+
+
+@router.post("/refresh")
+async def refresh(body: RefreshBody, request: Request, db: AsyncSession = Depends(get_db)):
+    return await refresh_session_tokens(db, body.refresh_token, request)
+
+
+@router.post("/logout")
+async def logout(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    await revoke_session(db, claims["session_id"], claims["phone"])
+    return {"message": "Logged out successfully"}
+
+
+@router.post("/logout-all")
+async def logout_all(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    await revoke_all_sessions(db, claims["phone"])
+    return {"message": "All sessions revoked successfully"}
 
 
 @router.get("/me")

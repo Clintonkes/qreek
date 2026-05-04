@@ -15,8 +15,9 @@ from database.session import get_db
 from database.models import Company, Employee, PayrollRun, PayrollEntry, AuditLog, User
 from core.web_jwt import decode_token
 from core.banks import resolve_bank, BANKS
-from services.security_service import verify_pin
-from core.payout import best_payout
+from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin
+from services.payment_service import debit_ngn_or_reject, refund_ngn
+from core.payout import best_payout, settle_fee
 
 router = APIRouter(prefix="/api/v1/payroll", tags=["payroll"])
 
@@ -468,9 +469,17 @@ async def execute_run(
         raise HTTPException(status_code=400, detail=f"Run is already {run.status}. Cannot re-execute.")
 
     # Verify PIN
-    ok = await verify_pin(db, phone, body.pin)
+    if await is_frozen(db, phone):
+        raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
+
+    ok = await verify_transaction_pin(db, phone, body.pin)
     if not ok:
-        raise HTTPException(status_code=401, detail="Incorrect PIN.")
+        remaining = await pin_attempts_remaining(db, phone)
+        if remaining <= 0:
+            raise HTTPException(status_code=403, detail="Account frozen after 5 failed PIN attempts.")
+        raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
+
+    await debit_ngn_or_reject(db, phone, run.total_gross)
 
     # Mark as processing
     run.status = "processing"
@@ -493,6 +502,7 @@ async def execute_run(
                 ref  = "QRK_PR_" + uuid.uuid4().hex[:10].upper()
                 try:
                     result = await best_payout(phone, entry.net_amount, bank, ref)
+                    await settle_fee(phone, entry.fee, ref)
                     entry.status   = "completed"
                     entry.provider = result.get("provider")
                     entry.reference = ref
@@ -502,6 +512,7 @@ async def execute_run(
                     entry.status    = "failed"
                     entry.error_msg = str(e)[:200]
                     run.failed_count = (run.failed_count or 0) + 1
+                    await refund_ngn(sess, phone, entry.gross_amount)
 
                 sess.add(entry)
                 await sess.flush()
