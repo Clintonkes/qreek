@@ -44,6 +44,10 @@ class PaymentRequestBody(BaseModel):
 
 
 def _pool_dict(pool: Pool, role: str = "member") -> dict:
+    """
+    Converts a Pool model instance into a dictionary for JSON response.
+    Includes the user's role in the pool.
+    """
     return {
         "id":           pool.id,
         "name":         pool.name,
@@ -59,6 +63,9 @@ def _pool_dict(pool: Pool, role: str = "member") -> dict:
 
 @router.get("")
 async def list_pools(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Lists all pools (crypto or fiat) that the authenticated user is a member of.
+    """
     phone = claims["phone"]
 
     result = await db.execute(select(PoolMember).where(PoolMember.user_phone == phone))
@@ -80,6 +87,10 @@ async def create_pool(
     claims: dict = Depends(decode_token),
     db:     AsyncSession = Depends(get_db),
 ):
+    """
+    Creates a new crypto or fiat pool. 
+    The creator is automatically assigned the 'admin' role.
+    """
     phone = claims["phone"]
     if body.pool_type not in ("crypto", "fiat"):
         raise HTTPException(status_code=400, detail="pool_type must be 'crypto' or 'fiat'")
@@ -106,6 +117,10 @@ async def join_pool(
     claims: dict = Depends(decode_token),
     db:     AsyncSession = Depends(get_db),
 ):
+    """
+    Joins an existing pool using an invite code.
+    Supports both crypto and fiat pools.
+    """
     phone = claims["phone"]
     code  = body.invite_code.strip().upper()
 
@@ -144,6 +159,9 @@ async def get_pool(
     claims:  dict = Depends(decode_token),
     db:      AsyncSession = Depends(get_db),
 ):
+    """
+    Retrieves the details and member list for a specific pool.
+    """
     phone = claims["phone"]
 
     # Try fiat pool first
@@ -200,8 +218,9 @@ async def pool_send(
     db:      AsyncSession = Depends(get_db),
 ):
     """
-    Facilitated NGN payment through a fiat pool.
-    Funds are never held — payout fires immediately via Yellow Card / Breet.
+    Processes a payout from a fiat pool.
+    Debits the sender's NGN balance and initiates an immediate payout to the recipient's bank.
+    Ensures the sender is a member of the pool and provides a correct PIN.
     """
     phone = claims["phone"]
 
@@ -269,6 +288,10 @@ async def pool_send(
 
 
 async def _fire_pool_payout(txn_id: str, phone: str, net: float, fee: float, bank: dict, ref: str):
+    """
+    Asynchronous background task to execute a pool payout.
+    Updates the transaction status upon success or failure, and handles refunds on failure.
+    """
     from database.session import AsyncSessionLocal
     try:
         result = await best_payout(phone, net, bank, ref)
@@ -300,6 +323,9 @@ async def pool_activity(
     claims:  dict = Depends(decode_token),
     db:      AsyncSession = Depends(get_db),
 ):
+    """
+    Retrieves the paginated activity feed for a specific pool.
+    """
     phone = claims["phone"]
     access = await db.execute(
         select(FiatPoolMember).where(FiatPoolMember.pool_id == pool_id, FiatPoolMember.user_phone == phone)
@@ -342,6 +368,10 @@ async def create_request(
     claims:  dict = Depends(decode_token),
     db:      AsyncSession = Depends(get_db),
 ):
+    """
+    Creates a new payment request within a fiat pool.
+    Only pool admins can create requests.
+    """
     phone = claims["phone"]
     access = await db.execute(
         select(FiatPoolMember).where(FiatPoolMember.pool_id == pool_id, FiatPoolMember.user_phone == phone)
@@ -382,6 +412,9 @@ async def list_requests(
     claims:  dict = Depends(decode_token),
     db:      AsyncSession = Depends(get_db),
 ):
+    """
+    Lists all active payment requests for a specific pool.
+    """
     phone = claims["phone"]
     access = await db.execute(
         select(FiatPoolMember).where(FiatPoolMember.pool_id == pool_id, FiatPoolMember.user_phone == phone)
@@ -407,3 +440,100 @@ async def list_requests(
             for req in reqs
         ]
     }
+
+
+# ── Pool protection: dispute reporting ───────────────────────────────────────
+
+class DisputeBody(BaseModel):
+    transaction_id: Optional[str] = None
+    request_id:     Optional[str] = None
+    description:    str
+
+
+@router.post("/{pool_id}/dispute")
+async def report_dispute(
+    pool_id: str,
+    body:    DisputeBody,
+    claims:  dict = Depends(decode_token),
+    db:      AsyncSession = Depends(get_db),
+):
+    """Any pool member can flag a suspicious transaction or payment request for review."""
+    phone = claims["phone"]
+    access = await db.execute(
+        select(FiatPoolMember).where(FiatPoolMember.pool_id == pool_id, FiatPoolMember.user_phone == phone)
+    )
+    if not access.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not a member of this pool.")
+    if not body.description or len(body.description.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Please describe the dispute in at least 10 characters.")
+
+    # Log the dispute in the AuditLog for support team review
+    from database.models import AuditLog
+    log = AuditLog(
+        actor_phone=phone,
+        action="pool_dispute_reported",
+        entity_type="fiat_pool",
+        entity_id=pool_id,
+        metadata={
+            "pool_id": pool_id,
+            "transaction_id": body.transaction_id,
+            "request_id": body.request_id,
+            "description": body.description,
+        }
+    )
+    db.add(log)
+    await db.commit()
+
+    return {
+        "message": "Dispute reported. Our support team will review within 24 hours and contact you.",
+        "reference": f"DISPUTE-{pool_id[:6].upper()}-{phone[-4:]}",
+    }
+
+
+# ── Pool protection: admin change audit ──────────────────────────────────────
+
+@router.post("/{pool_id}/admin/transfer")
+async def transfer_admin(
+    pool_id:   str,
+    new_phone: str,
+    claims:    dict = Depends(decode_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    """Transfer admin role to another pool member. Logged immutably."""
+    phone = claims["phone"]
+
+    # Verify current user is admin
+    admin_r = await db.execute(
+        select(FiatPoolMember).where(FiatPoolMember.pool_id == pool_id, FiatPoolMember.user_phone == phone, FiatPoolMember.role == "admin")
+    )
+    if not admin_r.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Only pool admins can transfer admin role.")
+
+    # Verify new admin is a member
+    new_r = await db.execute(
+        select(FiatPoolMember).where(FiatPoolMember.pool_id == pool_id, FiatPoolMember.user_phone == new_phone)
+    )
+    new_member = new_r.scalar_one_or_none()
+    if not new_member:
+        raise HTTPException(status_code=404, detail="That phone number is not a member of this pool.")
+
+    # Transfer
+    old_admin = admin_r.scalar_one_or_none()
+    if old_admin:
+        # Re-fetch since scalar_one_or_none consumed
+        old_admin_r = await db.execute(select(FiatPoolMember).where(FiatPoolMember.pool_id == pool_id, FiatPoolMember.user_phone == phone))
+        old_admin_obj = old_admin_r.scalar_one_or_none()
+        if old_admin_obj:
+            old_admin_obj.role = "member"
+
+    new_member.role = "admin"
+
+    from database.models import AuditLog
+    db.add(AuditLog(
+        actor_phone=phone, action="pool_admin_transferred",
+        entity_type="fiat_pool", entity_id=pool_id,
+        metadata={"from_phone": phone, "to_phone": new_phone, "pool_id": pool_id}
+    ))
+    await db.commit()
+
+    return {"message": f"Admin role transferred. All members have been notified via the activity feed."}

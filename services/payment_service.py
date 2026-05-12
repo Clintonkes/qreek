@@ -6,6 +6,11 @@ from database.models import User
 
 
 async def debit_ngn_or_reject(db: AsyncSession, phone: str, amount: float) -> User:
+    """
+    Attempts to debit a specified amount from a user's NGN balance.
+    Uses 'with_for_update' to lock the user row for atomic updates.
+    Raises HTTPException if balance is insufficient or user is not found.
+    """
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Debit amount must be greater than zero.")
 
@@ -21,6 +26,10 @@ async def debit_ngn_or_reject(db: AsyncSession, phone: str, amount: float) -> Us
 
 
 async def refund_ngn(db: AsyncSession, phone: str, amount: float) -> None:
+    """
+    Refunds a specified amount to a user's NGN balance.
+    Uses 'with_for_update' to ensure consistency during the update.
+    """
     if amount <= 0:
         return
 

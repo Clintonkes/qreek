@@ -20,6 +20,9 @@ class CreateAlertBody(BaseModel):
 
 @router.get("")
 async def list_alerts(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Lists all active (untriggered) price alerts for the authenticated user.
+    """
     phone  = claims["phone"]
     result = await db.execute(
         select(PriceAlert).where(PriceAlert.user_phone == phone, PriceAlert.triggered == False)
@@ -46,6 +49,10 @@ async def create_alert(
     claims: dict = Depends(decode_token),
     db:     AsyncSession = Depends(get_db),
 ):
+    """
+    Creates a new price alert for a supported cryptocurrency.
+    Automatically determines the alert direction (above/below) based on the current price if not provided.
+    """
     phone    = claims["phone"]
     currency = body.currency.upper()
 
@@ -78,6 +85,10 @@ async def delete_alert(
     claims:   dict = Depends(decode_token),
     db:       AsyncSession = Depends(get_db),
 ):
+    """
+    Deletes an existing price alert identified by its ID.
+    Ensures the alert belongs to the authenticated user.
+    """
     phone  = claims["phone"]
     result = await db.execute(
         select(PriceAlert).where(PriceAlert.id == alert_id, PriceAlert.user_phone == phone)

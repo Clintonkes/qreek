@@ -22,10 +22,16 @@ MONNIFY_BASE_URL = os.getenv("MONNIFY_BASE_URL", "https://sandbox.monnify.com/ap
 
 
 class MonnifyConfigError(Exception):
+    """
+    Custom exception raised when Monnify configuration (API keys, secret, etc.) is missing or invalid.
+    """
     pass
 
 
 def _get_client():
+    """
+    Helper function to create and return an asynchronous HTTPX client with a default timeout.
+    """
     return httpx.AsyncClient(timeout=15.0)
 
 

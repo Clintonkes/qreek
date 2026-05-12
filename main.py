@@ -8,6 +8,10 @@ import os
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Asynchronous context manager for the FastAPI application lifespan.
+    Handles the initialization of the database on startup.
+    """
     await init_db()
     yield
 
@@ -41,9 +45,16 @@ app.include_router(web_ws.router)
 
 @app.get("/")
 async def root():
+    """
+    Root endpoint for the API.
+    Returns a welcome message, version, and link to documentation.
+    """
     return {"message": "Qreek Web API", "version": "1.0.0", "docs": "/docs"}
 
 
 @app.get("/health")
 async def health():
+    """
+    Health check endpoint to verify the service is running.
+    """
     return {"status": "live", "service": "qreek-web"}

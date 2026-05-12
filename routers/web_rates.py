@@ -10,6 +10,9 @@ _redis = None
 
 
 async def _r():
+    """
+    Singleton-like access to the Redis client for caching exchange rates.
+    """
     global _redis
     if not _redis:
         _redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
@@ -18,6 +21,10 @@ async def _r():
 
 @router.get("")
 async def get_rates(fiat: str = Query(default="NGN")):
+    """
+    Retrieves current cryptocurrency exchange rates for a given fiat currency.
+    Uses Redis caching to reduce overhead, with a 30-second TTL.
+    """
     fiat      = fiat.upper()
     cache_key = f"web:rates:{fiat}"
 

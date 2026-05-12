@@ -42,6 +42,10 @@ class PayLinkIn(BaseModel):
 
 
 def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
+    """
+    Helper function to convert a PaymentLink model instance to a dictionary.
+    Optionally includes bank details (masked) for the link creator.
+    """
     d = {
         "id": l.id, "code": l.code, "title": l.title, "description": l.description,
         "amount": l.amount, "is_flexible": l.is_flexible,
@@ -65,6 +69,10 @@ async def create_link(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Creates a new shareable payment link for receiving NGN.
+    Validates the bank details and sets an optional expiration date.
+    """
     phone = claims["phone"]
 
     bank = resolve_bank(body.bank_code)
@@ -96,6 +104,9 @@ async def create_link(
 
 @router.get("")
 async def list_links(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Lists all payment links created by the authenticated user.
+    """
     phone  = claims["phone"]
     result = await db.execute(
         select(PaymentLink).where(PaymentLink.created_by == phone).order_by(desc(PaymentLink.created_at)).limit(50)
@@ -106,7 +117,10 @@ async def list_links(claims: dict = Depends(decode_token), db: AsyncSession = De
 
 @router.get("/resolve/{code}")
 async def resolve_link(code: str, db: AsyncSession = Depends(get_db)):
-    """Public endpoint — no auth needed. Anyone can view a payment link."""
+    """
+    Public endpoint to view a payment link by its unique code.
+    Validates that the link exists, is active, has not expired, and has not reached max uses.
+    """
     result = await db.execute(select(PaymentLink).where(PaymentLink.code == code.upper()))
     link   = result.scalar_one_or_none()
     if not link or not link.is_active:
@@ -125,7 +139,11 @@ async def pay_link(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
-    """Pay a payment link. Payer must be a Qreek user (needs PIN)."""
+    """
+    Processes a payment for a specific link.
+    Debits the payer's NGN balance and initiates a background payout to the link creator's bank.
+    Ensures the payer has a valid PIN and is not paying their own link.
+    """
     payer_phone = claims["phone"]
 
     result = await db.execute(select(PaymentLink).where(PaymentLink.code == code.upper()))
@@ -174,6 +192,10 @@ async def pay_link(
 
 
 async def _fire_link_payout(payer_phone: str, gross: float, net: float, fee: float, bank: dict, ref: str):
+    """
+    Asynchronous background task to settle a payment.
+    Attempts the payout and fee settlement. If any fails, refunds the gross amount to the payer.
+    """
     from database.session import AsyncSessionLocal
     try:
         await best_payout(payer_phone, net, bank, ref)
@@ -190,6 +212,9 @@ async def deactivate_link(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Deactivates a payment link, making it unavailable for future payments.
+    """
     phone  = claims["phone"]
     result = await db.execute(
         select(PaymentLink).where(PaymentLink.id == link_id, PaymentLink.created_by == phone)

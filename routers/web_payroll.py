@@ -75,6 +75,9 @@ class ExecuteRunIn(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _co_dict(c: Company) -> dict:
+    """
+    Converts a Company model instance into a dictionary for JSON response.
+    """
     return {
         "id": c.id, "name": c.name, "industry": c.industry,
         "rc_number": c.rc_number, "email": c.email, "address": c.address,
@@ -84,6 +87,9 @@ def _co_dict(c: Company) -> dict:
 
 
 def _emp_dict(e: Employee) -> dict:
+    """
+    Converts an Employee model instance into a dictionary, masking sensitive bank account details.
+    """
     return {
         "id": e.id, "company_id": e.company_id, "name": e.name,
         "email": e.email, "phone": e.phone,
@@ -97,6 +103,9 @@ def _emp_dict(e: Employee) -> dict:
 
 
 def _run_dict(r: PayrollRun) -> dict:
+    """
+    Converts a PayrollRun model instance into a dictionary for tracking batch payments.
+    """
     return {
         "id": r.id, "company_id": r.company_id, "period_label": r.period_label,
         "total_gross": r.total_gross, "total_fee": r.total_fee, "total_net": r.total_net,
@@ -109,6 +118,9 @@ def _run_dict(r: PayrollRun) -> dict:
 
 
 def _entry_dict(e: PayrollEntry) -> dict:
+    """
+    Converts a PayrollEntry model instance into a dictionary representing a single employee's payment.
+    """
     return {
         "id": e.id, "employee_name": e.employee_name,
         "bank_account": "****" + e.bank_account[-4:] if e.bank_account else None,
@@ -121,6 +133,10 @@ def _entry_dict(e: PayrollEntry) -> dict:
 
 
 async def _get_company(db: AsyncSession, phone: str) -> Company:
+    """
+    Helper to fetch the company associated with a user's phone number.
+    Raises 404 if no company is registered.
+    """
     r = await db.execute(select(Company).where(Company.owner_phone == phone))
     co = r.scalar_one_or_none()
     if not co:
@@ -130,6 +146,9 @@ async def _get_company(db: AsyncSession, phone: str) -> Company:
 
 async def _log(db: AsyncSession, phone: str, action: str, entity_type: str = None,
                entity_id: str = None, amount: float = None, request: Request = None, meta: dict = None):
+    """
+    Helper to record significant payroll events in the audit log.
+    """
     ip = request.client.host if request else None
     log = AuditLog(
         actor_phone=phone, action=action, entity_type=entity_type,
@@ -142,6 +161,9 @@ async def _log(db: AsyncSession, phone: str, action: str, entity_type: str = Non
 
 @router.get("/company")
 async def get_company(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Retrieves the company profile for the authenticated owner.
+    """
     phone = claims["phone"]
     r     = await db.execute(select(Company).where(Company.owner_phone == phone))
     co    = r.scalar_one_or_none()
@@ -156,6 +178,9 @@ async def create_company(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Registers a new company profile for an authenticated user.
+    """
     phone = claims["phone"]
     exists = await db.execute(select(Company).where(Company.owner_phone == phone))
     if exists.scalar_one_or_none():
@@ -174,6 +199,9 @@ async def update_company(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Updates the existing company profile details.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
     for k, v in body.model_dump(exclude_none=True).items():
@@ -191,6 +219,9 @@ async def list_employees(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Lists all employees in the user's company, with optional filtering by department and active status.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -212,6 +243,10 @@ async def add_employee(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Adds a new employee to the company roster.
+    Validates bank details and increments the company's employee count.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -240,6 +275,10 @@ async def bulk_add_employees(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Imports multiple employees at once.
+    Validates each record and returns a summary of successes and failures.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -277,6 +316,10 @@ async def update_employee(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Updates an employee's details (salary, department, job title, bank info, or active status).
+    Synchronizes the company's employee count if the active status changes.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -312,6 +355,9 @@ async def deactivate_employee(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Deactivates an employee (soft delete) and decrements the company's employee count.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -328,6 +374,9 @@ async def deactivate_employee(
 
 @router.get("/departments")
 async def list_departments(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Returns a distinct list of all departments existing in the company's roster.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
     r     = await db.execute(
@@ -343,6 +392,9 @@ async def list_runs(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Lists the history of payroll runs for the company.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
     r     = await db.execute(
@@ -435,6 +487,9 @@ async def get_run(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Retrieves the details of a specific payroll run, including all individual employee entries.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -548,6 +603,9 @@ async def cancel_run(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Cancels a pending payroll run, preventing it from being executed.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -567,6 +625,9 @@ async def cancel_run(
 
 @router.get("/analytics")
 async def get_analytics(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Retrieves high-level payroll analytics, including total disbursements, run history, and department spending.
+    """
     phone = claims["phone"]
     co    = await _get_company(db, phone)
 
@@ -605,4 +666,7 @@ async def get_analytics(claims: dict = Depends(decode_token), db: AsyncSession =
 
 @router.get("/banks")
 async def list_banks():
+    """
+    Returns a list of supported banks for payroll disbursements.
+    """
     return {"banks": [{"code": b["code"], "name": b["name"]} for b in BANKS]}

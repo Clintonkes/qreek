@@ -37,12 +37,19 @@ AsyncSessionLocal = sessionmaker(
 
 
 async def init_db():
+    """
+    Initializes the database by creating all tables defined in the SQLAlchemy models.
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     print("Database ready.")
 
 
 async def get_db():
+    """
+    Dependency function that provides an asynchronous database session.
+    Ensures the session is rolled back on error and closed after use.
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session

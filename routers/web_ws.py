@@ -32,12 +32,18 @@ FEE_SEND     = 0.001
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _ngn(v: float) -> str:
+    """
+    Formats a float value as a Naira string, with suffixes for millions.
+    """
     if v >= 1_000_000:
         return f"₦{v / 1_000_000:.2f}M"
     return f"₦{v:,.2f}"
 
 
 def _crypto(amount: float, currency: str) -> str:
+    """
+    Formats a cryptocurrency amount based on the specific currency's typical decimal precision.
+    """
     if currency in ("BTC", "ETH"):
         return f"{amount:.6f} {currency}"
     if currency in ("SOL", "BNB"):
@@ -46,15 +52,25 @@ def _crypto(amount: float, currency: str) -> str:
 
 
 def _out(message: str, step: str = "idle", pending: dict | None = None) -> str:
+    """
+    JSON-encodes a response message for the WebSocket client.
+    Includes the current workflow step and any pending transaction data.
+    """
     return json.dumps({"message": message, "step": step, "pending": pending})
 
 
 async def _user(db, phone: str) -> User | None:
+    """
+    Fetches a user record by phone number.
+    """
     r = await db.execute(select(User).where(User.phone == phone))
     return r.scalar_one_or_none()
 
 
 async def _in_pool(phone: str) -> bool:
+    """
+    Checks if a user is a member of any investment pool.
+    """
     async with AsyncSessionLocal() as db:
         r = await db.execute(select(PoolMember).where(PoolMember.user_phone == phone))
         return r.scalar_one_or_none() is not None
@@ -63,6 +79,9 @@ async def _in_pool(phone: str) -> bool:
 # ── intent handlers ───────────────────────────────────────────────────────────
 
 async def _sell(ws: WebSocket, phone: str, intent: dict):
+    """
+    Handles the 'sell' intent. Calculates the rate and fee, and prompts the user for a bank account.
+    """
     amount   = intent.get("amount")
     currency = (intent.get("currency") or "USDT").upper()
 
@@ -103,6 +122,9 @@ async def _sell(ws: WebSocket, phone: str, intent: dict):
 
 
 async def _buy(ws: WebSocket, phone: str, intent: dict):
+    """
+    Handles the 'buy' intent. Provides a buy rate (including spread) and a virtual account for payment.
+    """
     amount   = intent.get("amount")
     currency = (intent.get("currency") or "USDT").upper()
 
@@ -139,6 +161,9 @@ async def _buy(ws: WebSocket, phone: str, intent: dict):
 
 
 async def _send(ws: WebSocket, phone: str, intent: dict):
+    """
+    Handles the 'send' intent for cryptocurrency transfers to other Qreek users.
+    """
     amount    = intent.get("amount")
     currency  = (intent.get("currency") or "USDT").upper()
     recipient = intent.get("recipient")
@@ -172,6 +197,9 @@ async def _send(ws: WebSocket, phone: str, intent: dict):
 
 
 async def _portfolio(ws: WebSocket, phone: str):
+    """
+    Generates a portfolio summary for the user, listing balances in both crypto and NGN values.
+    """
     async with AsyncSessionLocal() as db:
         u = await _user(db, phone)
     rates = await get_all_rates("NGN")
@@ -200,6 +228,9 @@ async def _portfolio(ws: WebSocket, phone: str):
 
 
 async def _history(ws: WebSocket, phone: str):
+    """
+    Retrieves and displays the last 10 transactions for the user.
+    """
     async with AsyncSessionLocal() as db:
         r    = await db.execute(
             select(Transaction)
@@ -220,6 +251,9 @@ async def _history(ws: WebSocket, phone: str):
 
 
 async def _create_pool(ws: WebSocket, phone: str, intent: dict):
+    """
+    Handles the 'create_pool' intent. Creates a new investment pool and returns the invite code.
+    """
     name = (intent.get("pool_name") or "My Pool").strip()
     async with AsyncSessionLocal() as db:
         pool = Pool(name=name, creator_phone=phone, pool_type="crypto")
@@ -239,6 +273,9 @@ async def _create_pool(ws: WebSocket, phone: str, intent: dict):
 
 
 async def _join_pool(ws: WebSocket, phone: str, intent: dict):
+    """
+    Handles the 'join_pool' intent. Adds a user to a pool based on an invite code.
+    """
     code = (intent.get("pool_code") or "").strip().upper()
     if not code:
         await ws.send_text(_out("Provide a pool invite code. Example: join pool ABC123", "idle"))
@@ -264,6 +301,9 @@ async def _join_pool(ws: WebSocket, phone: str, intent: dict):
 
 
 async def _watch_price(ws: WebSocket, phone: str, intent: dict):
+    """
+    Handles the 'watch_price' intent. Creates a price alert for a specific cryptocurrency.
+    """
     currency     = (intent.get("currency") or "BTC").upper()
     target_price = intent.get("target_price")
     if not target_price:
@@ -284,6 +324,9 @@ async def _watch_price(ws: WebSocket, phone: str, intent: dict):
 
 
 async def _my_alerts(ws: WebSocket, phone: str):
+    """
+    Lists all active (untriggered) price alerts for the user.
+    """
     async with AsyncSessionLocal() as db:
         r      = await db.execute(
             select(PriceAlert).where(PriceAlert.user_phone == phone, PriceAlert.triggered == False)
@@ -299,6 +342,9 @@ async def _my_alerts(ws: WebSocket, phone: str):
 
 
 async def _refer(ws: WebSocket, phone: str):
+    """
+    Displays the user's referral code and the total number of referrals made.
+    """
     async with AsyncSessionLocal() as db:
         u     = await _user(db, phone)
         cr    = await db.execute(select(func.count()).where(Referral.referrer_phone == phone))
@@ -311,7 +357,9 @@ async def _refer(ws: WebSocket, phone: str):
 
 
 async def _ngn_send(ws: WebSocket, phone: str, intent: dict):
-    """Send NGN to any bank account — pool-facilitated, 0.3% fee, pass-through."""
+    """
+    Handles the 'ngn_send' intent. Prompts the user for bank details to facilitate a Naira transfer.
+    """
     amount    = intent.get("amount")
     recipient = intent.get("recipient")
 
@@ -371,6 +419,10 @@ def _help() -> str:
 # ── pending-state handler ─────────────────────────────────────────────────────
 
 async def _handle_pending(ws: WebSocket, phone: str, state: str, text: str) -> bool:
+    """
+    Main state machine for handling multi-step flows (sell, buy, send, etc.).
+    Processes user input based on the current session state.
+    """
     t = text.strip()
 
     if t.lower() in ("cancel", "stop", "abort"):
@@ -694,6 +746,10 @@ async def _handle_pending(ws: WebSocket, phone: str, state: str, text: str) -> b
 
 @router.websocket("/ws/trade")
 async def trade_ws(websocket: WebSocket):
+    """
+    Main WebSocket entry point for the Qreek conversational trade interface.
+    Authenticates users via JWT, welcomes them, and manages the interactive trade session.
+    """
     token = websocket.query_params.get("token")
     phone = None
 

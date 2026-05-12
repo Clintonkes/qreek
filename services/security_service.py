@@ -8,6 +8,10 @@ MAX_PIN_ATTEMPTS = 5
 
 
 async def set_pin(db: AsyncSession, phone: str, pin: str):
+    """
+    Sets or updates the transaction PIN for a user identified by their phone number.
+    Hashes the PIN before storing it in the database.
+    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec    = result.scalar_one_or_none()
     if not sec:
@@ -18,6 +22,10 @@ async def set_pin(db: AsyncSession, phone: str, pin: str):
 
 
 async def verify_pin(db: AsyncSession, phone: str, pin: str) -> bool:
+    """
+    Verifies the provided PIN against the hashed PIN stored in the database for a user.
+    Returns True if the PIN is correct, False otherwise.
+    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec    = result.scalar_one_or_none()
     if not sec or not sec.pin_hash:
@@ -26,6 +34,12 @@ async def verify_pin(db: AsyncSession, phone: str, pin: str) -> bool:
 
 
 async def verify_transaction_pin(db: AsyncSession, phone: str, pin: str) -> bool:
+    """
+    Verifies a transaction PIN and manages failed attempts.
+    If the PIN is correct, resets the failed attempt counter.
+    If incorrect, increments the counter and freezes the account if the maximum attempts are reached.
+    Returns False if the account is already frozen.
+    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec = result.scalar_one_or_none()
     if not sec or not sec.pin_hash or sec.account_frozen:
@@ -45,6 +59,9 @@ async def verify_transaction_pin(db: AsyncSession, phone: str, pin: str) -> bool
 
 
 async def pin_attempts_remaining(db: AsyncSession, phone: str) -> int:
+    """
+    Returns the number of remaining PIN attempts for a user before their account is frozen.
+    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec = result.scalar_one_or_none()
     if not sec:
@@ -53,12 +70,18 @@ async def pin_attempts_remaining(db: AsyncSession, phone: str) -> int:
 
 
 async def is_frozen(db: AsyncSession, phone: str) -> bool:
+    """
+    Checks if a user's account is currently frozen due to security concerns or failed PIN attempts.
+    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec    = result.scalar_one_or_none()
     return bool(sec and sec.account_frozen)
 
 
 async def freeze_account(db: AsyncSession, phone: str):
+    """
+    Manually freezes a user's account.
+    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec    = result.scalar_one_or_none()
     if sec:
@@ -67,6 +90,9 @@ async def freeze_account(db: AsyncSession, phone: str):
 
 
 async def unfreeze_account(db: AsyncSession, phone: str):
+    """
+    Unfreezes a user's account and resets their failed PIN attempt counter.
+    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec    = result.scalar_one_or_none()
     if sec:

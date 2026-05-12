@@ -10,6 +10,9 @@ router = APIRouter(prefix="/api/v1/wallet", tags=["wallet"])
 
 
 def _mask(account: str | None) -> str | None:
+    """
+    Masks a bank account number by replacing all but the last 4 digits with asterisks.
+    """
     if not account or len(account) < 4:
         return account
     return "****" + account[-4:]
@@ -17,6 +20,9 @@ def _mask(account: str | None) -> str | None:
 
 @router.get("/balances")
 async def get_balances(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Retrieves the current balances for all supported currencies for the authenticated user.
+    """
     phone  = claims["phone"]
     result = await db.execute(select(User).where(User.phone == phone))
     user   = result.scalar_one_or_none()
@@ -42,6 +48,10 @@ async def get_history(
     claims: dict = Depends(decode_token),
     db:     AsyncSession = Depends(get_db),
 ):
+    """
+    Retrieves the paginated transaction history for the authenticated user.
+    Masks sensitive information like bank account numbers.
+    """
     phone  = claims["phone"]
     offset = (page - 1) * limit
     result = await db.execute(
@@ -78,6 +88,10 @@ async def get_history(
 
 @router.get("/portfolio-value")
 async def get_portfolio_value(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """
+    Calculates the total value of the user's portfolio in NGN.
+    Includes a breakdown of each currency's balance, NGN value, and current exchange rate.
+    """
     phone  = claims["phone"]
     result = await db.execute(select(User).where(User.phone == phone))
     user   = result.scalar_one_or_none()
