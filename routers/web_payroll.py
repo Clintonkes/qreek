@@ -1,7 +1,20 @@
 """
-Enterprise Payroll API.
-Handles company setup, employee roster, and batch salary disbursements.
-All payments are pass-through via Yellow Card / Breet — Qreek never holds funds.
+@file web_payroll.py
+@description Enterprise Payroll API — handles batch salary disbursements and organization management.
+Enables organizations to manage employee rosters, preview payroll runs, and execute 
+secure parallel payouts.
+
+Flow:
+1. Organization Setup: Users register a company profile to unlock enterprise features.
+2. Roster Management: Admins add/import employees via CSV and manage departments/salaries.
+3. Execution Lifecycle:
+   a. Initialization: Create a "Payroll Run" (preview) with optional salary overrides.
+   b. Validation: Admins review the preview, fees, and total disbursement amount.
+   c. Execution: Requires PIN verification. Debits the owner's NGN balance and 
+      triggers asynchronous, non-blocking payouts to all employee banks.
+4. Transparency: Every payroll run generates an audit log and real-time status 
+   updates (pending -> processing -> completed/failed).
+5. Analytics: Provides organization-wide spending insights and department-level breakdowns.
 """
 import asyncio, uuid
 from datetime import datetime

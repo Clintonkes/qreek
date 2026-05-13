@@ -1,3 +1,16 @@
+"""
+@file web_pools.py
+@description Payment Pools API — manages group-based collections (ajo/esusu) and payouts.
+Supports both fiat (NGN) and crypto pools with member roles, activity feeds, and dispute tracking.
+
+Flow:
+1. Lifecycle: Users create, join (via invite code), and manage pools.
+2. Collections: Pool admins create payment requests broadcasted to all members.
+3. Disbursements: Members initiate payouts from the pool to external bank accounts, 
+   secured by a personal transaction PIN.
+4. Transparency: Every transaction is recorded on an immutable ledger visible to all members.
+5. Governance: Enables admin role transfers and community-based dispute reporting.
+"""
 import asyncio, uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException

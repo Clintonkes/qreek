@@ -1,6 +1,14 @@
 """
-Payment Links API — shareable URLs for receiving NGN payments.
-Anyone (Qreek user or not) can pay via a link. Funds go straight to creator's bank.
+@file web_payment_links.py
+@description Payment Links API — facilitates shareable URLs for receiving NGN payments.
+Anyone (Qreek user or not) can pay via a link. Funds go straight to the creator's bank account.
+
+Flow:
+1. Creation: Authenticated users define link parameters (title, amount, bank destination).
+2. Resolution: Public users (payers) fetch link details via a unique code.
+3. Execution: Payers submit payment info. The system debits the payer's wallet (if authenticated) 
+   and initiates an asynchronous bank payout to the creator.
+4. Security: Enforces link activity status, expiration dates, and usage limits (max_uses).
 """
 import uuid
 from datetime import datetime

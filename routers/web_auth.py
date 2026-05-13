@@ -1,3 +1,20 @@
+"""
+@file web_auth.py
+@description Authentication and User Management API.
+Handles user registration, login, session management (JWT), PIN security, 
+and recovery flows (Forgot PIN/OTP).
+
+Flow:
+1. Registration: Validates phone -> creates user -> sets PIN -> issues session tokens.
+2. Authentication: Verifies phone/PIN -> implements fail-safe rate limiting (Redis) 
+   -> freezes account after 5 failures -> issues JWT tokens (access + refresh).
+3. Session Management: Supports token refreshing, individual session revocation, 
+   and global logout (revoking all sessions).
+4. Security: Manages PIN updates and a multi-step recovery flow (OTP request -> verification 
+   -> token-based reset).
+5. Profile: Exposes user metadata and bank configuration for the authenticated user.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select

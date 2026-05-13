@@ -1,3 +1,16 @@
+"""
+@file main.py
+@description Entry point for the Qreek Web API.
+This file initializes the FastAPI application, configures CORS for secure frontend communication, 
+mounts all functional API routers, and manages the application lifespan.
+
+Flow:
+1. Startup: Triggers the `lifespan` event to initialize the database connection (via init_db).
+2. Middleware: Injects CORSMiddleware to allow requests from authorized frontend origins.
+3. Routing: Mounts specialized routers for auth, payments, pools, payroll, and more.
+4. Health: Provides monitoring endpoints (root and /health) for deployment status.
+"""
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
