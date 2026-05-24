@@ -24,8 +24,8 @@ ALGO   = "HS256"
 
 router = APIRouter(tags=["websocket"])
 
-FEE_EXTERNAL = 0.004
-FEE_POOL     = 0.0025
+FEE_EXTERNAL = 0.0021
+FEE_POOL     = 0.0015
 FEE_SEND     = 0.001
 
 
@@ -373,7 +373,7 @@ async def _ngn_send(ws: WebSocket, phone: str, intent: dict):
         await ws.send_text(_out("Minimum NGN send is ₦100.", "idle"))
         return
 
-    fee = round(amount * 0.003, 2)
+    fee = round(amount * 0.0015, 2)
     net = round(amount - fee, 2)
 
     # Find any fiat pool the user is in to apply pool pricing
@@ -384,7 +384,7 @@ async def _ngn_send(ws: WebSocket, phone: str, intent: dict):
     msg = (
         f"💳 Send ₦\n{'─' * 30}\n"
         f"Amount:  {_ngn(amount)}\n"
-        f"Fee (0.3%): {_ngn(fee)}\n"
+        f"Fee (0.15%): {_ngn(fee)}\n"
         f"Recipient gets: {_ngn(net)}\n\n"
         f"Reply with bank details:\n"
         f"account_number bank_code  recipient_name\n"
@@ -667,7 +667,7 @@ async def _handle_pending(ws: WebSocket, phone: str, state: str, text: str) -> b
             f"To:      {rec_name}\n"
             f"Bank:    {bank_name}  ****{account[-4:]}\n"
             f"Amount:  {_ngn(pending['amount'])}\n"
-            f"Fee (0.3%): {_ngn(pending['fee'])}\n"
+            f"Fee (0.15%): {_ngn(pending['fee'])}\n"
             f"They receive: {_ngn(pending['net'])}\n\n"
             f"Type YES to confirm or CANCEL to abort.",
             "confirm", pending,
@@ -718,7 +718,7 @@ async def _handle_pending(ws: WebSocket, phone: str, state: str, text: str) -> b
                 user_phone=phone, tx_type="fiat_send",
                 currency="NGN", amount=pending["amount"],
                 ngn_amount=pending["amount"],
-                fee=pending["fee"], fee_pct=0.003,
+                fee=pending["fee"], fee_pct=0.0015,
                 status="processing", reference=ref,
                 bank_account=pending["bank_account"],
                 bank_code=pending["bank_code"],

@@ -28,7 +28,7 @@ from services.security_service import is_frozen, pin_attempts_remaining, verify_
 
 router = APIRouter(prefix="/api/v1/pools", tags=["pools"])
 
-FEE_POOL_NGN = 0.003   # 0.3% for fiat pool sends
+FEE_POOL_NGN = 0.0015   # 0.15% for fiat pool sends
 
 
 class CreatePoolBody(BaseModel):

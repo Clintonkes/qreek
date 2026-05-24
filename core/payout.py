@@ -1,9 +1,13 @@
 import httpx, os, asyncio
+from services.flutterwave_service import create_transfer
 
 YC_BASE    = os.getenv("YELLOWCARD_API_URL", "https://api.yellowcard.io/v1")
 YC_KEY     = os.getenv("YELLOWCARD_API_KEY")
 BREET_BASE = os.getenv("BREET_BASE_URL", "https://api.breet.io/v1")
 BREET_KEY  = os.getenv("BREET_API_KEY")
+# Bank destination for Qreek's own fee revenue when a flow starts from an
+# internal Qreek wallet balance. Hosted Flutterwave collections keep the fee
+# in the Qreek Flutterwave merchant balance instead, so they do not need this.
 FEE_BANK_ACCOUNT = os.getenv("QREEK_FEE_ACCOUNT_NUMBER")
 FEE_BANK_CODE = os.getenv("QREEK_FEE_BANK_CODE")
 _client    = None
@@ -55,11 +59,26 @@ def _is_live_success(result: dict) -> bool:
 
 
 async def best_payout(phone: str, amount: float, bank: dict, ref: str) -> dict:
-    """Yellow Card first, Breet fallback. Called via asyncio.create_task."""
+    """Flutterwave first, with legacy providers as fallback. Called via asyncio.create_task."""
     if amount <= 0:
         raise ValueError("Payout amount must be greater than zero")
 
     last_error = None
+
+    try:
+        result = await create_transfer(
+            amount=amount,
+            bank_code=bank["bank_code"],
+            account_number=bank["account_number"],
+            reference=ref,
+            narration="Qreek Finance Payout",
+        )
+        if _is_live_success(result.get("data", {}) | {"status": result.get("status")}):
+            return result
+        last_error = RuntimeError(f"Flutterwave rejected payout: {result}")
+    except Exception as e:
+        last_error = e
+        print(f"Flutterwave failed ({e}), falling back to Yellow Card for {ref}")
 
     try:
         result = await asyncio.wait_for(_yc_payout(phone, amount, bank, ref), timeout=5.0)
@@ -80,12 +99,26 @@ async def best_payout(phone: str, amount: float, bank: dict, ref: str) -> dict:
 
 
 def fee_bank() -> dict:
+    """
+    Returns the bank account where Qreek fee revenue should be settled.
+
+    These values come from environment variables so production, staging, and
+    local development can point to different Qreek-owned accounts without
+    hardcoding sensitive settlement details in git.
+    """
     if not FEE_BANK_ACCOUNT or not FEE_BANK_CODE:
         raise RuntimeError("QREEK_FEE_ACCOUNT_NUMBER and QREEK_FEE_BANK_CODE must be configured")
     return {"account_number": FEE_BANK_ACCOUNT, "bank_code": FEE_BANK_CODE}
 
 
 async def settle_fee(phone: str, amount: float, ref: str) -> dict | None:
+    """
+    Moves Qreek's fee portion to the configured Qreek fee bank account.
+
+    This is used by wallet-funded payouts such as pool sends and payroll,
+    where the gross amount has already been debited internally and then split
+    into recipient net payout plus Qreek fee settlement.
+    """
     if amount <= 0:
         return None
     return await best_payout(phone, amount, fee_bank(), f"{ref}_FEE")
