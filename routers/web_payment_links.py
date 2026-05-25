@@ -31,7 +31,7 @@ FEE_PCT = 0.0021  # 0.21% for direct payment links
 
 class CreateLinkIn(BaseModel):
     title:        str
-    description:  Optional[str] = None
+    description:  str
     amount:       Optional[float] = None   # None = flexible
     bank_account: str
     bank_code:    str
@@ -46,9 +46,11 @@ class PayLinkIn(BaseModel):
     payer_name:   Optional[str] = None
     phone:        Optional[str] = None
     payer_phone:  Optional[str] = None
+    payment_description: Optional[str] = None
     note:         Optional[str] = None
     provider:     Optional[str] = "flutterwave"
     redirect_url: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 class ConfirmFlutterwaveIn(BaseModel):
@@ -79,6 +81,23 @@ def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
     return d
 
 
+def _provider_fee(data: dict) -> float:
+    """
+    Extracts Flutterwave's processing fee from a verification payload.
+    Flutterwave payloads can differ by payment method, so we accept the common
+    fee keys and fall back to charged_amount - amount when present.
+    """
+    for key in ("app_fee", "merchant_fee", "processor_fee"):
+        value = data.get(key)
+        if value is not None:
+            return round(float(value or 0), 2)
+    charged = data.get("charged_amount")
+    amount = data.get("amount")
+    if charged is not None and amount is not None:
+        return round(max(float(charged or 0) - float(amount or 0), 0), 2)
+    return 0.0
+
+
 async def _get_live_link(db: AsyncSession, code: str) -> PaymentLink:
     result = await db.execute(select(PaymentLink).where(PaymentLink.code == code.upper()))
     link = result.scalar_one_or_none()
@@ -107,7 +126,7 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
         raise HTTPException(status_code=404, detail="Payment link not found for reference.")
 
     if tx.status == "completed":
-        return {"payment": {"reference": tx.reference, "amount": tx.amount, "fee": tx.fee, "net": tx.ngn_amount, "status": tx.status}}
+        return {"payment": {"reference": tx.reference, "amount": tx.gross_amount or tx.amount, "fee": tx.qreek_fee or tx.fee, "net": tx.net_amount or tx.ngn_amount, "status": tx.status}}
 
     if not transaction_id:
         raise HTTPException(status_code=400, detail="Flutterwave transaction_id is required for verification.")
@@ -128,10 +147,13 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     if flw_status != "successful":
         raise HTTPException(status_code=400, detail="Flutterwave payment is not successful.")
 
+    tx.provider_transaction_id = str(data.get("id") or transaction_id)
+    tx.provider_fee = _provider_fee(data)
+
     # Transfer the customer's amount after verifying the payment
     try:
         transfer = await create_transfer(
-            amount=tx.ngn_amount,
+            amount=tx.net_amount or tx.ngn_amount,
             bank_code=link.bank_code,
             account_number=link.bank_account,
             reference=f"{tx.reference}_NET",
@@ -145,11 +167,13 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
         return {
             "payment": {
                 "reference": tx.reference,
-                "amount": tx.amount,
-                "fee": tx.fee,
-                "net": tx.ngn_amount,
+                "amount": tx.gross_amount or tx.amount,
+                "fee": tx.qreek_fee or tx.fee,
+                "provider_fee": tx.provider_fee,
+                "net": tx.net_amount or tx.ngn_amount,
                 "status": tx.status,
                 "provider": tx.provider,
+                "provider_transaction_id": tx.provider_transaction_id,
                 "payout_provider_reference": transfer.get("data", {}).get("reference"),
             }
         }
@@ -170,6 +194,9 @@ async def create_link(
     Validates the bank details and sets an optional expiration date.
     """
     phone = claims["phone"]
+
+    if not body.description.strip():
+        raise HTTPException(status_code=400, detail="Description is required.")
 
     bank = resolve_bank(body.bank_code)
     if not bank:
@@ -236,31 +263,70 @@ async def pay_link(
     amount = link.amount if not link.is_flexible else body.amount
     if not amount or amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount.")
+    payment_description = (body.payment_description or body.note or "").strip()
+    if not payment_description:
+        raise HTTPException(status_code=400, detail="Payment description is required.")
 
     fee = round(amount * FEE_PCT, 2)
     net = round(amount - fee, 2)
-    ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
+    idempotency_key = body.idempotency_key or f"{code.upper()}:{body.phone or body.payer_phone or 'anon'}:{amount}:{payment_description}"
+
+    existing_result = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key).with_for_update())
+    existing = existing_result.scalar_one_or_none()
+    if existing:
+        if existing.status == "completed":
+            return {
+                "message": "Payment already completed.",
+                "tx_ref": existing.tx_ref or existing.reference,
+                "reference": existing.reference,
+                "fee": existing.qreek_fee or existing.fee,
+                "net": existing.net_amount or existing.ngn_amount,
+                "status": existing.status,
+            }
+        if existing.provider_checkout_url:
+            return {
+                "message": f"Checkout already created for ₦{existing.gross_amount or existing.amount:,.2f}.",
+                "checkout_url": existing.provider_checkout_url,
+                "payment_url": existing.provider_checkout_url,
+                "tx_ref": existing.tx_ref or existing.reference,
+                "reference": existing.reference,
+                "fee": existing.qreek_fee or existing.fee,
+                "net": existing.net_amount or existing.ngn_amount,
+            }
+        ref = existing.reference
+    else:
+        ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
 
     payer_name = (body.name or body.payer_name or "Qreek payer").strip()
     payer_phone = body.phone or body.payer_phone
-    tx = Transaction(
-        user_phone=link.created_by,
-        tx_type="payment_link",
-        currency="NGN",
-        amount=amount,
-        ngn_amount=net,
-        fee=fee,
-        fee_pct=FEE_PCT,
-        status="pending",
-        provider="flutterwave",
-        reference=ref,
-        pool_id=link.id,
-        bank_account=link.bank_account,
-        bank_code=link.bank_code,
-        bank_name=link.bank_name,
-    )
-    db.add(tx)
-    await db.commit()
+    if not existing:
+        tx = Transaction(
+            user_phone=link.created_by,
+            tx_type="payment_link",
+            currency="NGN",
+            amount=amount,
+            ngn_amount=net,
+            gross_amount=amount,
+            qreek_fee=fee,
+            provider_fee=0.0,
+            net_amount=net,
+            fee=fee,
+            fee_pct=FEE_PCT,
+            status="pending",
+            provider="flutterwave",
+            reference=ref,
+            tx_ref=ref,
+            idempotency_key=idempotency_key,
+            payment_description=payment_description,
+            pool_id=link.id,
+            bank_account=link.bank_account,
+            bank_code=link.bank_code,
+            bank_name=link.bank_name,
+        )
+        db.add(tx)
+        await db.commit()
+    else:
+        tx = existing
 
     checkout = await initialize_checkout(
         tx_ref=ref,
@@ -269,16 +335,19 @@ async def pay_link(
         customer_phone=payer_phone,
         redirect_url=body.redirect_url,
         title=link.title,
-        description=body.note or link.description,
+        description=payment_description,
         metadata={
             "code": link.code,
             "link_id": link.id,
             "creator_phone": link.created_by,
+            "payment_description": payment_description,
             "qreek_fee": fee,
             "net_amount": net,
         },
     )
     checkout_url = checkout.get("data", {}).get("link")
+    tx.provider_checkout_url = checkout_url
+    await db.commit()
 
     return {
         "message": f"Checkout created for ₦{amount:,.2f} to {link.title}.",

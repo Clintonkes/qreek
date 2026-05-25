@@ -42,7 +42,51 @@ async def init_db():
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_ledger_columns(conn)
     print("Database ready.")
+
+
+async def _ensure_ledger_columns(conn):
+    """
+    Idempotently adds explicit payment ledger columns to existing databases.
+
+    create_all() creates missing tables but does not alter already-created
+    tables, so Railway/Supabase deployments need these ADD COLUMN IF NOT EXISTS
+    statements before the API can insert the new ledger fields.
+    """
+    statements = [
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS gross_amount DOUBLE PRECISION",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS qreek_fee DOUBLE PRECISION DEFAULT 0.0",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_fee DOUBLE PRECISION DEFAULT 0.0",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS net_amount DOUBLE PRECISION",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_ref VARCHAR",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_checkout_url VARCHAR",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_description VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_transactions_reference ON transactions (reference)",
+        "CREATE INDEX IF NOT EXISTS ix_transactions_tx_ref ON transactions (tx_ref)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_idempotency_key ON transactions (idempotency_key) WHERE idempotency_key IS NOT NULL",
+        "ALTER TABLE pool_transactions ADD COLUMN IF NOT EXISTS gross_amount DOUBLE PRECISION",
+        "ALTER TABLE pool_transactions ADD COLUMN IF NOT EXISTS qreek_fee DOUBLE PRECISION DEFAULT 0.0",
+        "ALTER TABLE pool_transactions ADD COLUMN IF NOT EXISTS provider_fee DOUBLE PRECISION DEFAULT 0.0",
+        "ALTER TABLE pool_transactions ADD COLUMN IF NOT EXISTS tx_ref VARCHAR",
+        "ALTER TABLE pool_transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR",
+        "ALTER TABLE pool_transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_pool_transactions_reference ON pool_transactions (reference)",
+        "CREATE INDEX IF NOT EXISTS ix_pool_transactions_tx_ref ON pool_transactions (tx_ref)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_pool_transactions_idempotency_key ON pool_transactions (idempotency_key) WHERE idempotency_key IS NOT NULL",
+        "ALTER TABLE payroll_entries ADD COLUMN IF NOT EXISTS qreek_fee DOUBLE PRECISION DEFAULT 0.0",
+        "ALTER TABLE payroll_entries ADD COLUMN IF NOT EXISTS provider_fee DOUBLE PRECISION DEFAULT 0.0",
+        "ALTER TABLE payroll_entries ADD COLUMN IF NOT EXISTS tx_ref VARCHAR",
+        "ALTER TABLE payroll_entries ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR",
+        "ALTER TABLE payroll_entries ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_payroll_entries_reference ON payroll_entries (reference)",
+        "CREATE INDEX IF NOT EXISTS ix_payroll_entries_tx_ref ON payroll_entries (tx_ref)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_payroll_entries_idempotency_key ON payroll_entries (idempotency_key) WHERE idempotency_key IS NOT NULL",
+    ]
+    for statement in statements:
+        await conn.exec_driver_sql(statement)
 
 
 async def get_db():
