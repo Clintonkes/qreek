@@ -4,6 +4,7 @@ import hmac
 import logging
 import os
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
 
@@ -42,6 +43,7 @@ async def initialize_checkout(
     title: str,
     description: Optional[str] = None,
     metadata: Optional[dict] = None,
+    subaccounts: Optional[list[dict]] = None,
 ) -> dict:
     fallback_redirect = FRONTEND_URL
     if metadata and metadata.get("code"):
@@ -63,6 +65,8 @@ async def initialize_checkout(
         },
         "meta": metadata or {},
     }
+    if subaccounts:
+        payload["subaccounts"] = subaccounts
 
     async with _client() as client:
         response = await client.post(f"{FLW_BASE_URL}/payments", headers=_headers(), json=payload)
@@ -73,6 +77,25 @@ async def initialize_checkout(
     if not link:
         raise RuntimeError(f"Flutterwave checkout link missing: {data}")
     return data
+
+
+async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
+    """
+    Asks Flutterwave for the provider fee on a checkout amount so Qreek can
+    charge the payer once and still settle the recipient's full amount.
+    """
+    query = urlencode({"amount": round(float(amount or 0), 2), "currency": currency})
+    async with _client() as client:
+        response = await client.get(f"{FLW_BASE_URL}/transactions/fee?{query}", headers=_headers())
+        if response.is_error:
+            logger.warning("Flutterwave fee lookup failed: %s %s", response.status_code, response.text[:300])
+            return 0.0
+        data = response.json().get("data", {})
+    for key in ("fee", "app_fee", "merchant_fee", "charge_amount"):
+        value = data.get(key)
+        if value is not None:
+            return round(float(value or 0), 2)
+    return 0.0
 
 
 async def verify_transaction(transaction_id: str | int) -> dict:
@@ -104,6 +127,8 @@ async def create_transfer(
 
     async with _client() as client:
         response = await client.post(f"{FLW_BASE_URL}/transfers", headers=_headers(), json=payload)
+        if response.is_error:
+            raise RuntimeError(f"Flutterwave transfer failed ({response.status_code}): {response.text[:500]}")
         response.raise_for_status()
         data = response.json()
     return {"provider": "flutterwave", **data}

@@ -24,7 +24,7 @@ ALGO   = "HS256"
 
 router = APIRouter(tags=["websocket"])
 
-FEE_EXTERNAL = 0.0021
+FEE_EXTERNAL = 0.0025
 FEE_POOL     = 0.0015
 FEE_SEND     = 0.001
 

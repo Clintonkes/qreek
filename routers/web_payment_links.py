@@ -22,11 +22,25 @@ from database.session import get_db
 from database.models import PaymentLink, Transaction
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
-from services.flutterwave_service import create_transfer, initialize_checkout, verify_transaction
+from services.flutterwave_service import create_transfer, initialize_checkout, query_transaction_fee, verify_transaction
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
-FEE_PCT = 0.0021  # 0.21% for direct payment links
+FEE_PCT = 0.0025  # 0.25% for direct payment links
+
+
+async def _checkout_total_for_recipient(recipient_amount: float) -> tuple[float, float, float]:
+    """
+    Builds a one-time payer total where the link owner receives the requested
+    amount and Qreek's fee is added on top of that amount.
+    """
+    qreek_fee = round(recipient_amount * FEE_PCT, 2)
+    checkout_amount = round(recipient_amount + qreek_fee, 2)
+    provider_fee = 0.0
+    for _ in range(2):
+        provider_fee = await query_transaction_fee(checkout_amount)
+        checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
+    return checkout_amount, qreek_fee, provider_fee
 
 
 class CreateLinkIn(BaseModel):
@@ -57,6 +71,28 @@ class ConfirmFlutterwaveIn(BaseModel):
     transaction_id: Optional[str] = None
     tx_ref:         Optional[str] = None
     status:         Optional[str] = None
+
+
+def _payment_dict(tx: Transaction) -> dict:
+    """
+    Returns the public payment status shape used by checkout redirects and
+    polling. A transaction is only complete after recipient settlement succeeds.
+    """
+    return {
+        "reference": tx.reference,
+        "amount": tx.gross_amount or tx.amount,
+        "fee": tx.qreek_fee or tx.fee,
+        "provider_fee": tx.provider_fee,
+        "provider_settled_amount": tx.provider_settled_amount,
+        "net": tx.net_amount or tx.ngn_amount,
+        "recipient_amount": tx.net_amount or tx.ngn_amount,
+        "checkout_amount": tx.gross_amount or tx.amount,
+        "status": tx.status,
+        "provider": tx.provider,
+        "provider_transaction_id": tx.provider_transaction_id,
+        "payout_status": tx.payout_status,
+        "payout_reference": tx.payout_reference,
+    }
 
 
 def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
@@ -98,6 +134,19 @@ def _provider_fee(data: dict) -> float:
     return 0.0
 
 
+def _provider_settled_amount(data: dict, amount: float, provider_fee: float) -> float:
+    """
+    Calculates what Flutterwave actually settled into Qreek's merchant balance.
+    That settled amount is the maximum pot available for recipient payout plus
+    Qreek's own fee.
+    """
+    for key in ("amount_settled", "settled_amount", "merchant_amount"):
+        value = data.get(key)
+        if value is not None:
+            return round(float(value or 0), 2)
+    return round(max(float(amount or 0) - float(provider_fee or 0), 0), 2)
+
+
 async def _get_live_link(db: AsyncSession, code: str) -> PaymentLink:
     result = await db.execute(select(PaymentLink).where(PaymentLink.code == code.upper()))
     link = result.scalar_one_or_none()
@@ -125,8 +174,8 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     if not link:
         raise HTTPException(status_code=404, detail="Payment link not found for reference.")
 
-    if tx.status == "completed":
-        return {"payment": {"reference": tx.reference, "amount": tx.gross_amount or tx.amount, "fee": tx.qreek_fee or tx.fee, "net": tx.net_amount or tx.ngn_amount, "status": tx.status}}
+    if tx.status == "completed" and tx.payout_status == "completed":
+        return {"payment": _payment_dict(tx)}
 
     if not transaction_id:
         raise HTTPException(status_code=400, detail="Flutterwave transaction_id is required for verification.")
@@ -142,45 +191,56 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
         raise HTTPException(status_code=400, detail="Flutterwave reference does not match this payment.")
     if flw_currency != "NGN":
         raise HTTPException(status_code=400, detail="Unsupported payment currency.")
-    if round(flw_amount, 2) != round(tx.amount, 2):
+    if round(flw_amount, 2) != round(tx.gross_amount or tx.amount, 2):
         raise HTTPException(status_code=400, detail="Flutterwave amount does not match this payment.")
     if flw_status != "successful":
         raise HTTPException(status_code=400, detail="Flutterwave payment is not successful.")
 
     tx.provider_transaction_id = str(data.get("id") or transaction_id)
     tx.provider_fee = _provider_fee(data)
+    tx.provider_settled_amount = _provider_settled_amount(data, tx.gross_amount or tx.amount, tx.provider_fee)
+    recipient_amount = tx.net_amount or tx.ngn_amount
+    if (tx.provider_settled_amount or 0) < recipient_amount:
+        tx.status = "payout_pending"
+        tx.payout_status = "pending"
+        tx.payout_reference = f"{tx.reference}_NET"
+        tx.payout_error = (
+            f"Flutterwave settled {tx.provider_settled_amount}, below recipient amount {recipient_amount}. "
+            "Increase provider-fee allowance or use Flutterwave split settlement."
+        )
+        await db.commit()
+        return {"payment": _payment_dict(tx)}
 
-    # Transfer the customer's amount after verifying the payment
+    was_unsettled = tx.payout_status != "completed"
+    tx.status = "processing"
+    tx.provider = "flutterwave"
+    tx.payout_status = "pending"
+
+    # Transfer the customer's net amount after verifying the payment.
+    # The transaction only becomes completed after this recipient payout works.
     try:
         transfer = await create_transfer(
-            amount=tx.net_amount or tx.ngn_amount,
+            amount=recipient_amount,
             bank_code=link.bank_code,
             account_number=link.bank_account,
             reference=f"{tx.reference}_NET",
             narration=f"QreekPay: {link.title}"[:100],
         )
+        tx.payout_status = "completed"
+        tx.payout_reference = transfer.get("data", {}).get("reference") or f"{tx.reference}_NET"
+        tx.payout_error = None
         tx.status = "completed"
-        tx.provider = "flutterwave"
-        link.use_count = (link.use_count or 0) + 1
-        link.total_collected = (link.total_collected or 0) + tx.amount
-        await db.commit()
-        return {
-            "payment": {
-                "reference": tx.reference,
-                "amount": tx.gross_amount or tx.amount,
-                "fee": tx.qreek_fee or tx.fee,
-                "provider_fee": tx.provider_fee,
-                "net": tx.net_amount or tx.ngn_amount,
-                "status": tx.status,
-                "provider": tx.provider,
-                "provider_transaction_id": tx.provider_transaction_id,
-                "payout_provider_reference": transfer.get("data", {}).get("reference"),
-            }
-        }
     except Exception as exc:
-        tx.status = "processing"
-        await db.commit()
-        raise HTTPException(status_code=502, detail=f"Payment verified, but payout is still pending: {str(exc)[:120]}")
+        tx.status = "payout_pending"
+        tx.payout_status = "pending"
+        tx.payout_reference = f"{tx.reference}_NET"
+        tx.payout_error = str(exc)[:1000]
+
+    if was_unsettled and tx.payout_status == "completed":
+        link.use_count = (link.use_count or 0) + 1
+        link.total_collected = (link.total_collected or 0) + (tx.net_amount or tx.ngn_amount or 0)
+    await db.commit()
+    return {"payment": _payment_dict(tx)}
 
 
 @router.post("")
@@ -260,28 +320,30 @@ async def pay_link(
     """
     link = await _get_live_link(db, code)
 
-    amount = link.amount if not link.is_flexible else body.amount
-    if not amount or amount <= 0:
+    recipient_amount = link.amount if not link.is_flexible else body.amount
+    if not recipient_amount or recipient_amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount.")
     payment_description = (body.payment_description or body.note or "").strip()
     if not payment_description:
         raise HTTPException(status_code=400, detail="Payment description is required.")
 
-    fee = round(amount * FEE_PCT, 2)
-    net = round(amount - fee, 2)
-    idempotency_key = body.idempotency_key or f"{code.upper()}:{body.phone or body.payer_phone or 'anon'}:{amount}:{payment_description}"
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(recipient_amount)
+    idempotency_key = body.idempotency_key or f"{code.upper()}:{body.phone or body.payer_phone or 'anon'}:{recipient_amount}:{payment_description}"
 
     existing_result = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key).with_for_update())
     existing = existing_result.scalar_one_or_none()
     if existing:
-        if existing.status == "completed":
+        if existing.status in ("completed", "processing", "payout_pending"):
             return {
-                "message": "Payment already completed.",
+                "message": "Payment already recorded.",
                 "tx_ref": existing.tx_ref or existing.reference,
                 "reference": existing.reference,
                 "fee": existing.qreek_fee or existing.fee,
                 "net": existing.net_amount or existing.ngn_amount,
+                "recipient_amount": existing.net_amount or existing.ngn_amount,
+                "checkout_amount": existing.gross_amount or existing.amount,
                 "status": existing.status,
+                "payout_status": existing.payout_status,
             }
         if existing.provider_checkout_url:
             return {
@@ -292,6 +354,8 @@ async def pay_link(
                 "reference": existing.reference,
                 "fee": existing.qreek_fee or existing.fee,
                 "net": existing.net_amount or existing.ngn_amount,
+                "recipient_amount": existing.net_amount or existing.ngn_amount,
+                "checkout_amount": existing.gross_amount or existing.amount,
             }
         ref = existing.reference
     else:
@@ -304,12 +368,13 @@ async def pay_link(
             user_phone=link.created_by,
             tx_type="payment_link",
             currency="NGN",
-            amount=amount,
-            ngn_amount=net,
-            gross_amount=amount,
+            amount=checkout_amount,
+            ngn_amount=recipient_amount,
+            gross_amount=checkout_amount,
             qreek_fee=fee,
-            provider_fee=0.0,
-            net_amount=net,
+            provider_fee=provider_fee_estimate,
+            provider_settled_amount=round(checkout_amount - provider_fee_estimate, 2),
+            net_amount=recipient_amount,
             fee=fee,
             fee_pct=FEE_PCT,
             status="pending",
@@ -330,7 +395,7 @@ async def pay_link(
 
     checkout = await initialize_checkout(
         tx_ref=ref,
-        amount=amount,
+        amount=checkout_amount,
         customer_name=payer_name,
         customer_phone=payer_phone,
         redirect_url=body.redirect_url,
@@ -342,7 +407,9 @@ async def pay_link(
             "creator_phone": link.created_by,
             "payment_description": payment_description,
             "qreek_fee": fee,
-            "net_amount": net,
+            "recipient_amount": recipient_amount,
+            "provider_fee_estimate": provider_fee_estimate,
+            "checkout_amount": checkout_amount,
         },
     )
     checkout_url = checkout.get("data", {}).get("link")
@@ -350,13 +417,16 @@ async def pay_link(
     await db.commit()
 
     return {
-        "message": f"Checkout created for ₦{amount:,.2f} to {link.title}.",
+        "message": f"Checkout created for ₦{checkout_amount:,.2f}. Recipient receives ₦{recipient_amount:,.2f}.",
         "checkout_url": checkout_url,
         "payment_url": checkout_url,
         "tx_ref": ref,
         "reference": ref,
         "fee": fee,
-        "net": net,
+        "provider_fee_estimate": provider_fee_estimate,
+        "net": recipient_amount,
+        "recipient_amount": recipient_amount,
+        "checkout_amount": checkout_amount,
     }
 
 
@@ -376,6 +446,33 @@ async def confirm_flutterwave_link_payment(
         raise HTTPException(status_code=400, detail="Missing Flutterwave tx_ref.")
     result = await finalize_flutterwave_link_payment(db, body.tx_ref, body.transaction_id)
     return result
+
+
+@router.get("/pay/{code}/status/{tx_ref}")
+async def get_link_payment_status(
+    code: str,
+    tx_ref: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public checkout status endpoint. It lets the redirect page keep showing
+    progress after Flutterwave has collected funds while Qreek awaits recipient
+    bank settlement.
+    """
+    link_result = await db.execute(select(PaymentLink).where(PaymentLink.code == code.upper()))
+    link = link_result.scalar_one_or_none()
+    if not link:
+        raise HTTPException(status_code=404, detail="Payment link not found.")
+    result = await db.execute(
+        select(Transaction).where(
+            Transaction.reference == tx_ref,
+            Transaction.pool_id == link.id,
+        )
+    )
+    tx = result.scalar_one_or_none()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Payment reference not found.")
+    return {"payment": _payment_dict(tx)}
 
 
 @router.delete("/{link_id}")
