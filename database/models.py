@@ -96,6 +96,20 @@ class Transaction(Base):
     created_at      = Column(DateTime, default=datetime.utcnow)
 
 
+class PaymentEvent(Base):
+    """Durable event log for payment provider flows and settlement debugging."""
+    __tablename__   = "payment_events"
+    id              = Column(String, primary_key=True, default=lambda: "evt_" + uuid.uuid4().hex[:12])
+    provider        = Column(String, default="flutterwave")
+    reference       = Column(String, nullable=True)
+    transaction_id  = Column(String, nullable=True)
+    event_type      = Column(String, nullable=False)
+    status          = Column(String, nullable=True)
+    message         = Column(Text, nullable=True)
+    payload         = Column(JSON, nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+
 class Pool(Base):
     __tablename__         = "pools"
     id                    = Column(String, primary_key=True, default=lambda: "pool_" + uuid.uuid4().hex[:8].upper())
@@ -321,6 +335,9 @@ class PaymentLink(Base):
     bank_account   = Column(String, nullable=True)
     bank_code      = Column(String, nullable=True)
     bank_name      = Column(String, nullable=True)
+    flutterwave_subaccount_id = Column(String, nullable=True)
+    flutterwave_subaccount_status = Column(String, nullable=True)
+    flutterwave_subaccount_error = Column(Text, nullable=True)
     max_uses       = Column(Integer, nullable=True)
     use_count      = Column(Integer, default=0)
     total_collected= Column(Float, default=0.0)

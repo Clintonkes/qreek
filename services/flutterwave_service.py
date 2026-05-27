@@ -98,6 +98,37 @@ async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
     return 0.0
 
 
+async def create_collection_subaccount(
+    *,
+    account_bank: str,
+    account_number: str,
+    business_name: str,
+    business_mobile: Optional[str] = None,
+    country: str = "NG",
+    split_type: str = "flat",
+    split_value: float = 0.0,
+) -> dict:
+    """
+    Creates a Flutterwave collection subaccount for split payments.
+    The checkout can then send the recipient's share directly to this account.
+    """
+    payload = {
+        "account_bank": account_bank,
+        "account_number": account_number,
+        "business_name": business_name[:100],
+        "business_mobile": business_mobile or "00000000000",
+        "country": country,
+        "split_type": split_type,
+        "split_value": split_value,
+    }
+    async with _client() as client:
+        response = await client.post(f"{FLW_BASE_URL}/subaccounts", headers=_headers(), json=payload)
+        if response.is_error:
+            raise RuntimeError(f"Flutterwave subaccount creation failed ({response.status_code}): {response.text[:500]}")
+        response.raise_for_status()
+        return response.json()
+
+
 async def verify_transaction(transaction_id: str | int) -> dict:
     async with _client() as client:
         response = await client.get(f"{FLW_BASE_URL}/transactions/{transaction_id}/verify", headers=_headers())

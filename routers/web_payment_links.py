@@ -22,7 +22,8 @@ from database.session import get_db
 from database.models import PaymentLink, Transaction
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
-from services.flutterwave_service import create_transfer, initialize_checkout, query_transaction_fee, verify_transaction
+from services.payment_event_logger import log_payment_event
+from services.flutterwave_service import create_collection_subaccount, create_transfer, initialize_checkout, query_transaction_fee, verify_transaction
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
@@ -114,6 +115,8 @@ def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
     if show_bank:
         d["bank_account"] = "****" + l.bank_account[-4:] if l.bank_account else None
         d["bank_code"]    = l.bank_code
+        d["flutterwave_subaccount_id"] = l.flutterwave_subaccount_id
+        d["flutterwave_subaccount_status"] = l.flutterwave_subaccount_status
     return d
 
 
@@ -159,6 +162,56 @@ async def _get_live_link(db: AsyncSession, code: str) -> PaymentLink:
     return link
 
 
+async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
+    """
+    Ensures a payment link has a Flutterwave collection subaccount so checkout
+    can settle the recipient directly through split payments.
+    """
+    if link.flutterwave_subaccount_id:
+        return
+    try:
+        await log_payment_event(
+            db,
+            event_type="flutterwave.subaccount.ensure.started",
+            reference=link.code,
+            status="started",
+            payload={"link_id": link.id, "bank_code": link.bank_code, "account_number_last4": (link.bank_account or "")[-4:]},
+        )
+        subaccount = await create_collection_subaccount(
+            account_bank=link.bank_code,
+            account_number=link.bank_account,
+            business_name=link.title,
+            business_mobile=link.created_by,
+            split_type="percentage",
+            split_value=FEE_PCT,
+        )
+        data = subaccount.get("data", {})
+        link.flutterwave_subaccount_id = data.get("id") or data.get("subaccount_id")
+        link.flutterwave_subaccount_status = "active" if link.flutterwave_subaccount_id else "missing_id"
+        link.flutterwave_subaccount_error = None if link.flutterwave_subaccount_id else str(subaccount)[:1000]
+        await log_payment_event(
+            db,
+            event_type="flutterwave.subaccount.ensure.completed",
+            reference=link.code,
+            status=link.flutterwave_subaccount_status,
+            payload={"link_id": link.id, "subaccount_id": link.flutterwave_subaccount_id, "flutterwave": data},
+        )
+        await db.commit()
+    except Exception as exc:
+        link.flutterwave_subaccount_status = "failed"
+        link.flutterwave_subaccount_error = str(exc)[:1000]
+        await log_payment_event(
+            db,
+            event_type="flutterwave.subaccount.ensure.failed",
+            reference=link.code,
+            status="failed",
+            message=link.flutterwave_subaccount_error,
+            payload={"link_id": link.id},
+        )
+        await db.commit()
+        raise HTTPException(status_code=502, detail="Could not prepare recipient settlement account. Please try again shortly.")
+
+
 async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, transaction_id: str | int = None) -> dict:
     """
     Verifies a Flutterwave payment, settles the creator's net amount, and records the fee.
@@ -167,19 +220,24 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     tx_result = await db.execute(select(Transaction).where(Transaction.reference == tx_ref).with_for_update())
     tx = tx_result.scalar_one_or_none()
     if not tx:
+        await log_payment_event(db, event_type="payment.finalize.missing_reference", reference=tx_ref, transaction_id=transaction_id, status="failed")
         raise HTTPException(status_code=404, detail="Payment reference not found.")
 
     link_result = await db.execute(select(PaymentLink).where(PaymentLink.id == tx.pool_id).with_for_update())
     link = link_result.scalar_one_or_none()
     if not link:
+        await log_payment_event(db, event_type="payment.finalize.missing_link", reference=tx_ref, transaction_id=transaction_id, status="failed")
         raise HTTPException(status_code=404, detail="Payment link not found for reference.")
 
     if tx.status == "completed" and tx.payout_status == "completed":
+        await log_payment_event(db, event_type="payment.finalize.idempotent_completed", reference=tx_ref, transaction_id=transaction_id, status="completed")
         return {"payment": _payment_dict(tx)}
 
     if not transaction_id:
+        await log_payment_event(db, event_type="payment.finalize.missing_transaction_id", reference=tx_ref, status="failed")
         raise HTTPException(status_code=400, detail="Flutterwave transaction_id is required for verification.")
 
+    await log_payment_event(db, event_type="flutterwave.verify.started", reference=tx_ref, transaction_id=transaction_id, status="started")
     verified = await verify_transaction(transaction_id)
     data = verified.get("data", {})
     flw_status = str(data.get("status", "")).lower()
@@ -188,18 +246,62 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     flw_amount = float(data.get("amount") or 0)
 
     if flw_ref != tx.reference:
+        await log_payment_event(db, event_type="flutterwave.verify.reference_mismatch", reference=tx_ref, transaction_id=transaction_id, status="failed", payload={"flutterwave_ref": flw_ref})
         raise HTTPException(status_code=400, detail="Flutterwave reference does not match this payment.")
     if flw_currency != "NGN":
+        await log_payment_event(db, event_type="flutterwave.verify.currency_mismatch", reference=tx_ref, transaction_id=transaction_id, status="failed", payload={"currency": flw_currency})
         raise HTTPException(status_code=400, detail="Unsupported payment currency.")
     if round(flw_amount, 2) != round(tx.gross_amount or tx.amount, 2):
+        await log_payment_event(db, event_type="flutterwave.verify.amount_mismatch", reference=tx_ref, transaction_id=transaction_id, status="failed", payload={"flutterwave_amount": flw_amount, "expected_amount": tx.gross_amount or tx.amount})
         raise HTTPException(status_code=400, detail="Flutterwave amount does not match this payment.")
     if flw_status != "successful":
+        await log_payment_event(db, event_type="flutterwave.verify.not_successful", reference=tx_ref, transaction_id=transaction_id, status=flw_status, payload={"flutterwave_status": flw_status})
         raise HTTPException(status_code=400, detail="Flutterwave payment is not successful.")
 
     tx.provider_transaction_id = str(data.get("id") or transaction_id)
     tx.provider_fee = _provider_fee(data)
     tx.provider_settled_amount = _provider_settled_amount(data, tx.gross_amount or tx.amount, tx.provider_fee)
     recipient_amount = tx.net_amount or tx.ngn_amount
+    was_unsettled = tx.payout_status not in ("completed", "split_settlement")
+    await log_payment_event(
+        db,
+        event_type="flutterwave.verify.successful",
+        reference=tx_ref,
+        transaction_id=transaction_id,
+        status="successful",
+        payload={
+            "checkout_amount": tx.gross_amount or tx.amount,
+            "recipient_amount": recipient_amount,
+            "qreek_fee": tx.qreek_fee or tx.fee,
+            "provider_fee": tx.provider_fee,
+            "provider_settled_amount": tx.provider_settled_amount,
+        },
+    )
+    if link.flutterwave_subaccount_id:
+        tx.status = "completed"
+        tx.provider = "flutterwave"
+        tx.payout_status = "split_settlement"
+        tx.payout_reference = link.flutterwave_subaccount_id
+        tx.payout_error = None
+        if was_unsettled:
+            link.use_count = (link.use_count or 0) + 1
+            link.total_collected = (link.total_collected or 0) + (tx.net_amount or tx.ngn_amount or 0)
+        await log_payment_event(
+            db,
+            event_type="flutterwave.split.completed",
+            reference=tx_ref,
+            transaction_id=transaction_id,
+            status="completed",
+            payload={
+                "subaccount_id": link.flutterwave_subaccount_id,
+                "recipient_amount": recipient_amount,
+                "qreek_fee": tx.qreek_fee or tx.fee,
+                "checkout_amount": tx.gross_amount or tx.amount,
+            },
+        )
+        await db.commit()
+        return {"payment": _payment_dict(tx)}
+
     if (tx.provider_settled_amount or 0) < recipient_amount:
         tx.status = "payout_pending"
         tx.payout_status = "pending"
@@ -208,6 +310,7 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
             f"Flutterwave settled {tx.provider_settled_amount}, below recipient amount {recipient_amount}. "
             "Increase provider-fee allowance or use Flutterwave split settlement."
         )
+        await log_payment_event(db, event_type="payout.skipped.insufficient_settlement", reference=tx_ref, transaction_id=transaction_id, status="pending", message=tx.payout_error)
         await db.commit()
         return {"payment": _payment_dict(tx)}
 
@@ -219,6 +322,14 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     # Transfer the customer's net amount after verifying the payment.
     # The transaction only becomes completed after this recipient payout works.
     try:
+        await log_payment_event(
+            db,
+            event_type="flutterwave.transfer.started",
+            reference=tx_ref,
+            transaction_id=transaction_id,
+            status="started",
+            payload={"amount": recipient_amount, "bank_code": link.bank_code, "account_number_last4": (link.bank_account or "")[-4:]},
+        )
         transfer = await create_transfer(
             amount=recipient_amount,
             bank_code=link.bank_code,
@@ -230,11 +341,13 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
         tx.payout_reference = transfer.get("data", {}).get("reference") or f"{tx.reference}_NET"
         tx.payout_error = None
         tx.status = "completed"
+        await log_payment_event(db, event_type="flutterwave.transfer.completed", reference=tx_ref, transaction_id=transaction_id, status="completed", payload=transfer.get("data", transfer))
     except Exception as exc:
         tx.status = "payout_pending"
         tx.payout_status = "pending"
         tx.payout_reference = f"{tx.reference}_NET"
         tx.payout_error = str(exc)[:1000]
+        await log_payment_event(db, event_type="flutterwave.transfer.failed", reference=tx_ref, transaction_id=transaction_id, status="pending", message=tx.payout_error)
 
     if was_unsettled and tx.payout_status == "completed":
         link.use_count = (link.use_count or 0) + 1
@@ -282,6 +395,46 @@ async def create_link(
     db.add(link)
     await db.commit()
     await db.refresh(link)
+
+    try:
+        await log_payment_event(
+            db,
+            event_type="flutterwave.subaccount.create.started",
+            status="started",
+            payload={"link_id": link.id, "bank_code": body.bank_code, "account_number_last4": body.bank_account[-4:]},
+        )
+        subaccount = await create_collection_subaccount(
+            account_bank=body.bank_code,
+            account_number=body.bank_account,
+            business_name=body.title,
+            business_mobile=phone,
+            split_type="percentage",
+            split_value=FEE_PCT,
+        )
+        data = subaccount.get("data", {})
+        link.flutterwave_subaccount_id = data.get("id") or data.get("subaccount_id")
+        link.flutterwave_subaccount_status = "active" if link.flutterwave_subaccount_id else "missing_id"
+        link.flutterwave_subaccount_error = None if link.flutterwave_subaccount_id else str(subaccount)[:1000]
+        await log_payment_event(
+            db,
+            event_type="flutterwave.subaccount.create.completed",
+            reference=link.code,
+            status=link.flutterwave_subaccount_status,
+            payload={"link_id": link.id, "subaccount_id": link.flutterwave_subaccount_id, "flutterwave": data},
+        )
+    except Exception as exc:
+        link.flutterwave_subaccount_status = "failed"
+        link.flutterwave_subaccount_error = str(exc)[:1000]
+        await log_payment_event(
+            db,
+            event_type="flutterwave.subaccount.create.failed",
+            reference=link.code,
+            status="failed",
+            message=link.flutterwave_subaccount_error,
+            payload={"link_id": link.id},
+        )
+    await db.commit()
+    await db.refresh(link)
     return {"link": _link_dict(link, show_bank=True)}
 
 
@@ -319,6 +472,7 @@ async def pay_link(
     The payer can complete with card, bank transfer, or any method enabled on Flutterwave.
     """
     link = await _get_live_link(db, code)
+    await _ensure_link_subaccount(db, link)
 
     recipient_amount = link.amount if not link.is_flexible else body.amount
     if not recipient_amount or recipient_amount <= 0:
@@ -328,12 +482,21 @@ async def pay_link(
         raise HTTPException(status_code=400, detail="Payment description is required.")
 
     checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(recipient_amount)
+    platform_charge = round(checkout_amount - recipient_amount, 2)
     idempotency_key = body.idempotency_key or f"{code.upper()}:{body.phone or body.payer_phone or 'anon'}:{recipient_amount}:{payment_description}"
+    await log_payment_event(
+        db,
+        event_type="checkout.quote.created",
+        reference=None,
+        status="created",
+        payload={"recipient_amount": recipient_amount, "checkout_amount": checkout_amount, "qreek_fee": fee, "provider_fee_estimate": provider_fee_estimate, "platform_charge": platform_charge, "subaccount_id": link.flutterwave_subaccount_id},
+    )
 
     existing_result = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key).with_for_update())
     existing = existing_result.scalar_one_or_none()
     if existing:
         if existing.status in ("completed", "processing", "payout_pending"):
+            await log_payment_event(db, event_type="checkout.idempotent.recorded", reference=existing.reference, status=existing.status)
             return {
                 "message": "Payment already recorded.",
                 "tx_ref": existing.tx_ref or existing.reference,
@@ -346,6 +509,7 @@ async def pay_link(
                 "payout_status": existing.payout_status,
             }
         if existing.provider_checkout_url:
+            await log_payment_event(db, event_type="checkout.idempotent.reused_url", reference=existing.reference, status=existing.status)
             return {
                 "message": f"Checkout already created for ₦{existing.gross_amount or existing.amount:,.2f}.",
                 "checkout_url": existing.provider_checkout_url,
@@ -390,9 +554,11 @@ async def pay_link(
         )
         db.add(tx)
         await db.commit()
+        await log_payment_event(db, event_type="checkout.transaction.created", reference=ref, status="pending", payload={"checkout_amount": checkout_amount, "recipient_amount": recipient_amount, "qreek_fee": fee, "provider_fee_estimate": provider_fee_estimate, "platform_charge": platform_charge, "subaccount_id": link.flutterwave_subaccount_id})
     else:
         tx = existing
 
+    await log_payment_event(db, event_type="flutterwave.checkout.started", reference=ref, status="started", payload={"checkout_amount": checkout_amount, "subaccount_id": link.flutterwave_subaccount_id, "platform_charge": platform_charge})
     checkout = await initialize_checkout(
         tx_ref=ref,
         amount=checkout_amount,
@@ -411,9 +577,15 @@ async def pay_link(
             "provider_fee_estimate": provider_fee_estimate,
             "checkout_amount": checkout_amount,
         },
+        subaccounts=[{
+            "id": link.flutterwave_subaccount_id,
+            "transaction_charge_type": "flat",
+            "transaction_charge": platform_charge,
+        }],
     )
     checkout_url = checkout.get("data", {}).get("link")
     tx.provider_checkout_url = checkout_url
+    await log_payment_event(db, event_type="flutterwave.checkout.created", reference=ref, status="created", payload={"checkout_url": checkout_url, "flutterwave": checkout.get("data", {})})
     await db.commit()
 
     return {
@@ -441,9 +613,12 @@ async def confirm_flutterwave_link_payment(
     The backend verifies status, tx_ref, amount, and currency before recording success.
     """
     if body.status and body.status.lower() not in ("successful", "completed"):
+        await log_payment_event(db, event_type="flutterwave.redirect.not_successful", reference=body.tx_ref, transaction_id=body.transaction_id, status=body.status)
         raise HTTPException(status_code=400, detail="Flutterwave did not mark this payment successful.")
     if not body.tx_ref:
+        await log_payment_event(db, event_type="flutterwave.redirect.missing_tx_ref", transaction_id=body.transaction_id, status="failed")
         raise HTTPException(status_code=400, detail="Missing Flutterwave tx_ref.")
+    await log_payment_event(db, event_type="flutterwave.redirect.received", reference=body.tx_ref, transaction_id=body.transaction_id, status=body.status)
     result = await finalize_flutterwave_link_payment(db, body.tx_ref, body.transaction_id)
     return result
 
@@ -471,7 +646,9 @@ async def get_link_payment_status(
     )
     tx = result.scalar_one_or_none()
     if not tx:
+        await log_payment_event(db, event_type="checkout.status.missing_reference", reference=tx_ref, status="failed")
         raise HTTPException(status_code=404, detail="Payment reference not found.")
+    await log_payment_event(db, event_type="checkout.status.polled", reference=tx_ref, status=tx.status, payload={"payout_status": tx.payout_status})
     return {"payment": _payment_dict(tx)}
 
 
