@@ -41,8 +41,12 @@ async def init_db():
     Initializes the database by creating all tables defined in the SQLAlchemy models.
     """
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await _ensure_ledger_columns(conn)
+        await conn.exec_driver_sql("SELECT pg_advisory_lock(774411)")
+        try:
+            await conn.run_sync(Base.metadata.create_all)
+            await _ensure_ledger_columns(conn)
+        finally:
+            await conn.exec_driver_sql("SELECT pg_advisory_unlock(774411)")
     print("Database ready.")
 
 
