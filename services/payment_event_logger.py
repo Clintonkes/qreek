@@ -1,4 +1,5 @@
 import logging
+import json
 from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,16 +35,25 @@ async def log_payment_event(
     It never raises, so logging cannot break checkout or webhook processing.
     """
     safe_payload = _trim(payload or {})
-    logger.info(
-        "payment_event provider=%s type=%s reference=%s transaction_id=%s status=%s message=%s payload=%s",
-        provider,
-        event_type,
-        reference,
-        transaction_id,
-        status,
-        message,
-        safe_payload,
-    )
+    log_record = {
+        "provider": provider,
+        "event_type": event_type,
+        "reference": reference,
+        "transaction_id": transaction_id,
+        "status": status,
+        "message": message,
+        "payload": safe_payload,
+    }
+    log_line = "payment_event " + json.dumps(log_record, default=str, separators=(",", ":"))
+    if status in ("failed", "error") or "failed" in event_type:
+        logger.error(log_line)
+        print(log_line, flush=True)
+    elif status in ("pending", "missing_id") or "skipped" in event_type:
+        logger.warning(log_line)
+        print(log_line, flush=True)
+    else:
+        logger.info(log_line)
+        print(log_line, flush=True)
     try:
         db.add(PaymentEvent(
             provider=provider,

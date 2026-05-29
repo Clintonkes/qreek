@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 from typing import Optional
@@ -18,6 +19,21 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "https://qreekfinance.org")
 
 class FlutterwaveConfigError(Exception):
     pass
+
+
+class FlutterwaveAPIError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int | None = None, response_text: str | None = None, payload: dict | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
+        self.payload = payload or {}
+
+    def as_payload(self) -> dict:
+        return {
+            "status_code": self.status_code,
+            "response_text": self.response_text,
+            "request_payload": self.payload,
+        }
 
 
 def _headers() -> dict:
@@ -124,7 +140,21 @@ async def create_collection_subaccount(
     async with _client() as client:
         response = await client.post(f"{FLW_BASE_URL}/subaccounts", headers=_headers(), json=payload)
         if response.is_error:
-            raise RuntimeError(f"Flutterwave subaccount creation failed ({response.status_code}): {response.text[:500]}")
+            safe_payload = {**payload, "account_number": f"******{account_number[-4:]}"}
+            error_record = {
+                "event_type": "flutterwave.subaccount.api.failed",
+                "status_code": response.status_code,
+                "response_text": response.text[:1000],
+                "request_payload": safe_payload,
+            }
+            logger.error("payment_event %s", json.dumps(error_record, separators=(",", ":")))
+            print("payment_event " + json.dumps(error_record, separators=(",", ":")), flush=True)
+            raise FlutterwaveAPIError(
+                f"Flutterwave subaccount creation failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+                payload=safe_payload,
+            )
         response.raise_for_status()
         return response.json()
 

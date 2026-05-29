@@ -14,16 +14,16 @@ import uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, or_
 from pydantic import BaseModel
 from typing import Optional
 
 from database.session import get_db
-from database.models import PaymentLink, Transaction
+from database.models import PaymentEvent, PaymentLink, Transaction
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import create_collection_subaccount, create_transfer, initialize_checkout, query_transaction_fee, verify_transaction
+from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, create_transfer, initialize_checkout, query_transaction_fee, verify_transaction
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
@@ -200,16 +200,19 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
     except Exception as exc:
         link.flutterwave_subaccount_status = "failed"
         link.flutterwave_subaccount_error = str(exc)[:1000]
+        error_payload = {"link_id": link.id}
+        if isinstance(exc, FlutterwaveAPIError):
+            error_payload.update(exc.as_payload())
         await log_payment_event(
             db,
             event_type="flutterwave.subaccount.ensure.failed",
             reference=link.code,
             status="failed",
             message=link.flutterwave_subaccount_error,
-            payload={"link_id": link.id},
+            payload=error_payload,
         )
         await db.commit()
-        raise HTTPException(status_code=502, detail="Could not prepare recipient settlement account. Please try again shortly.")
+        raise HTTPException(status_code=502, detail="Could not prepare recipient settlement account. Check Railway payment_event logs for Flutterwave's subaccount response.")
 
 
 async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, transaction_id: str | int = None) -> dict:
@@ -425,13 +428,16 @@ async def create_link(
     except Exception as exc:
         link.flutterwave_subaccount_status = "failed"
         link.flutterwave_subaccount_error = str(exc)[:1000]
+        error_payload = {"link_id": link.id}
+        if isinstance(exc, FlutterwaveAPIError):
+            error_payload.update(exc.as_payload())
         await log_payment_event(
             db,
             event_type="flutterwave.subaccount.create.failed",
             reference=link.code,
             status="failed",
             message=link.flutterwave_subaccount_error,
-            payload={"link_id": link.id},
+            payload=error_payload,
         )
     await db.commit()
     await db.refresh(link)
@@ -650,6 +656,61 @@ async def get_link_payment_status(
         raise HTTPException(status_code=404, detail="Payment reference not found.")
     await log_payment_event(db, event_type="checkout.status.polled", reference=tx_ref, status=tx.status, payload={"payout_status": tx.payout_status})
     return {"payment": _payment_dict(tx)}
+
+
+@router.get("/debug/events/{reference}")
+async def get_payment_events(
+    reference: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns recent payment events for a reference or link code. This is for
+    Railway/live debugging when provider errors need to be inspected quickly.
+    """
+    phone = claims["phone"]
+    link_result = await db.execute(
+        select(PaymentLink).where(
+            PaymentLink.created_by == phone,
+            or_(PaymentLink.code == reference.upper(), PaymentLink.id == reference),
+        )
+    )
+    link = link_result.scalar_one_or_none()
+    tx_result = await db.execute(
+        select(Transaction).where(
+            Transaction.user_phone == phone,
+            or_(Transaction.reference == reference, Transaction.tx_ref == reference),
+        )
+    )
+    tx = tx_result.scalar_one_or_none()
+    if not link and not tx:
+        raise HTTPException(status_code=404, detail="No payment events found for this account.")
+
+    refs = {reference}
+    if link:
+        refs.update({link.code, link.id})
+    if tx:
+        refs.update(v for v in (tx.reference, tx.tx_ref, tx.pool_id) if v)
+
+    result = await db.execute(
+        select(PaymentEvent)
+        .where(PaymentEvent.reference.in_(list(refs)))
+        .order_by(desc(PaymentEvent.created_at))
+        .limit(50)
+    )
+    events = result.scalars().all()
+    return {
+        "events": [
+            {
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "event_type": e.event_type,
+                "status": e.status,
+                "message": e.message,
+                "payload": e.payload,
+            }
+            for e in events
+        ]
+    }
 
 
 @router.delete("/{link_id}")
