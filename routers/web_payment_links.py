@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from database.session import get_db
-from database.models import PaymentEvent, PaymentLink, Transaction
+from database.models import PaymentEvent, PaymentLink, Transaction, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
@@ -201,11 +201,16 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             status="started",
             payload={"link_id": link.id, "bank_code": link.bank_code, "account_number_last4": (link.bank_account or "")[-4:]},
         )
+        security_result = await db.execute(
+            select(UserSecurity).where(UserSecurity.phone == link.created_by)
+        )
+        security = security_result.scalar_one_or_none()
         subaccount = await create_collection_subaccount(
             account_bank=link.bank_code,
             account_number=link.bank_account,
             business_name=link.title,
             business_mobile=link.created_by,
+            business_email=security.recovery_email if security else None,
             split_type="percentage",
             split_value=FEE_PCT,
         )
@@ -423,6 +428,11 @@ async def create_link(
     await db.commit()
     await db.refresh(link)
 
+    creator_security_result = await db.execute(
+        select(UserSecurity).where(UserSecurity.phone == phone)
+    )
+    creator_security = creator_security_result.scalar_one_or_none()
+
     try:
         await log_payment_event(
             db,
@@ -435,6 +445,7 @@ async def create_link(
             account_number=body.bank_account,
             business_name=body.title,
             business_mobile=phone,
+            business_email=creator_security.recovery_email if creator_security else None,
             split_type="percentage",
             split_value=FEE_PCT,
         )
