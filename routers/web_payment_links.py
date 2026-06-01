@@ -404,6 +404,20 @@ async def create_link(
     """
     phone = claims["phone"]
 
+    # Enforce one active personal payment link per user
+    existing_link_result = await db.execute(
+        select(PaymentLink).where(
+            PaymentLink.created_by == phone,
+            PaymentLink.is_active == True,
+            PaymentLink.pool_id.is_(None)
+        )
+    )
+    if existing_link_result.scalar_first():
+        raise HTTPException(
+            status_code=400,
+            detail="You already have an active personal payment link. Please edit your existing link's bank details instead of creating a new one."
+        )
+
     if not body.description.strip():
         raise HTTPException(status_code=400, detail="Description is required.")
 
