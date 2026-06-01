@@ -218,7 +218,8 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             split_value=0.9975,
         )
         data = subaccount.get("data", {})
-        link.flutterwave_subaccount_id = data.get("id") or data.get("subaccount_id")
+        sub_id = data.get("subaccount_id") or data.get("id")
+        link.flutterwave_subaccount_id = str(sub_id) if sub_id else None
         link.flutterwave_subaccount_status = "active" if link.flutterwave_subaccount_id else "missing_id"
         link.flutterwave_subaccount_error = None if link.flutterwave_subaccount_id else str(subaccount)[:1000]
         await log_payment_event(
@@ -453,7 +454,8 @@ async def create_link(
             split_value=0.9975,
         )
         data = subaccount.get("data", {})
-        link.flutterwave_subaccount_id = data.get("id") or data.get("subaccount_id")
+        sub_id = data.get("subaccount_id") or data.get("id")
+        link.flutterwave_subaccount_id = str(sub_id) if sub_id else None
         link.flutterwave_subaccount_status = "active" if link.flutterwave_subaccount_id else "missing_id"
         link.flutterwave_subaccount_error = None if link.flutterwave_subaccount_id else str(subaccount)[:1000]
         await log_payment_event(
