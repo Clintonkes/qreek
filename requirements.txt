@@ -3,7 +3,7 @@ uvicorn[standard]==0.30.0
 gunicorn==22.0.0
 httpx==0.28.1
 python-dotenv==1.0.1
-sqlalchemy[asyncio]==2.0.30
+sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 passlib==1.7.4
 bcrypt==4.2.1
