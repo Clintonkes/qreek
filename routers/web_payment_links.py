@@ -10,8 +10,11 @@ Flow:
    with card, bank transfer, or any method enabled on the Qreek merchant account.
 4. Security: Enforces link activity status, expiration dates, and usage limits (max_uses).
 """
+import logging
 import uuid
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, or_
