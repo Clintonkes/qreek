@@ -215,7 +215,7 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             business_mobile=link.created_by,
             business_email=security.recovery_email if security else None,
             split_type="percentage",
-            split_value=FEE_PCT,
+            split_value=0.9,
         )
         data = subaccount.get("data", {})
         link.flutterwave_subaccount_id = data.get("id") or data.get("subaccount_id")
@@ -450,7 +450,7 @@ async def create_link(
             business_mobile=phone,
             business_email=creator_security.recovery_email if creator_security else None,
             split_type="percentage",
-            split_value=FEE_PCT,
+            split_value=0.9,
         )
         data = subaccount.get("data", {})
         link.flutterwave_subaccount_id = data.get("id") or data.get("subaccount_id")
