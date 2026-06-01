@@ -166,8 +166,32 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
     """
     Ensures a payment link has a Flutterwave collection subaccount so checkout
     can settle the recipient directly through split payments.
+
+    Uses SELECT FOR UPDATE to serialise concurrent worker requests so only one
+    worker attempts subaccount creation; the rest pick up the created ID.
     """
     if link.flutterwave_subaccount_id:
+        return
+    # Re-fetch under a row-level lock so concurrent workers wait here and
+    # the winner's result is visible to all subsequent readers.
+    locked_result = await db.execute(
+        select(PaymentLink).where(PaymentLink.id == link.id).with_for_update()
+    )
+    locked_link = locked_result.scalar_one_or_none()
+    if locked_link and locked_link.flutterwave_subaccount_id:
+        # Another worker already created it while we were waiting for the lock
+        link.flutterwave_subaccount_id = locked_link.flutterwave_subaccount_id
+        link.flutterwave_subaccount_status = locked_link.flutterwave_subaccount_status
+        return
+    if locked_link and locked_link.flutterwave_subaccount_status == "failed":
+        # A previous attempt already failed (bad bank details or persistent API error).
+        # Do not retry on every pay request — let checkout proceed without split
+        # settlement; the manual transfer payout path will handle settlement instead.
+        logger.warning(
+            "Skipping subaccount re-creation for link %s (status=failed, last_error=%s)",
+            link.code,
+            locked_link.flutterwave_subaccount_error,
+        )
         return
     try:
         await log_payment_event(

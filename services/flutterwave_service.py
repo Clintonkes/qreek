@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -47,6 +48,37 @@ def _headers() -> dict:
 
 def _client():
     return httpx.AsyncClient(timeout=20.0)
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict,
+    json_body: dict,
+    retries: int = 3,
+    backoff: float = 1.0,
+) -> httpx.Response:
+    """
+    POST with exponential backoff for transient 5xx errors (e.g. Flutterwave
+    returning a 502 Cloudflare Bad Gateway during brief upstream outages).
+    Only 5xx responses are retried; 4xx errors are returned immediately since
+    they represent caller/config problems, not transient infrastructure issues.
+    """
+    last_response = None
+    for attempt in range(retries):
+        response = await client.post(url, headers=headers, json=json_body)
+        if response.status_code < 500:          # 2xx, 3xx, 4xx — do not retry
+            return response
+        last_response = response
+        if attempt < retries - 1:
+            wait = backoff * (2 ** attempt)     # 1s, 2s, ...
+            logger.warning(
+                "Flutterwave returned %s on attempt %d/%d — retrying in %.1fs",
+                response.status_code, attempt + 1, retries, wait,
+            )
+            await asyncio.sleep(wait)
+    return last_response  # all retries exhausted, return last 5xx response
 
 
 async def initialize_checkout(
@@ -138,17 +170,16 @@ async def create_collection_subaccount(
         "split_value": split_value,
     }
     async with _client() as client:
-        response = await client.post(f"{FLW_BASE_URL}/subaccounts", headers=_headers(), json=payload)
+        response = await _post_with_retry(
+            client,
+            f"{FLW_BASE_URL}/subaccounts",
+            headers=_headers(),
+            json_body=payload,
+        )
         if response.is_error:
             safe_payload = {**payload, "account_number": f"******{account_number[-4:]}"}
-            error_record = {
-                "event_type": "flutterwave.subaccount.api.failed",
-                "status_code": response.status_code,
-                "response_text": response.text[:1000],
-                "request_payload": safe_payload,
-            }
-            logger.error("payment_event %s", json.dumps(error_record, separators=(",", ":")))
-            print("payment_event " + json.dumps(error_record, separators=(",", ":")), flush=True)
+            # Raise with full context — the caller is responsible for structured
+            # logging so we avoid double-logging the same failure event.
             raise FlutterwaveAPIError(
                 f"Flutterwave subaccount creation failed ({response.status_code})",
                 status_code=response.status_code,
