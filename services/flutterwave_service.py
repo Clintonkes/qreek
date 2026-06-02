@@ -192,6 +192,36 @@ async def create_collection_subaccount(
         return response.json()
 
 
+async def update_subaccount_split(
+    subaccount_id: str,
+    split_type: str = "percentage",
+    split_value: float = 0.0025,
+) -> dict:
+    """
+    Updates an existing subaccount's default split config so that the subaccount
+    record on the Flutterwave dashboard reflects the correct split (main gets 0.25%).
+    The per-tx override in checkout still takes precedence for individual payments.
+    Uses the subaccount_id (RS_...) or numeric id.
+    """
+    payload = {
+        "split_type": split_type,
+        "split_value": split_value,
+    }
+    async with _client() as client:
+        # The update endpoint accepts the subaccount identifier (RS_ or numeric)
+        response = await client.put(
+            f"{FLW_BASE_URL}/subaccounts/{subaccount_id}",
+            headers=_headers(),
+            json=payload,
+        )
+        if response.is_error:
+            # Don't fail the payment if update fails; override at tx time is what matters
+            logger.warning("Failed to update subaccount %s split: %s", subaccount_id, response.text[:300])
+            return {"status": "error", "message": response.text[:500]}
+        response.raise_for_status()
+        return response.json()
+
+
 async def verify_transaction(transaction_id: str | int) -> dict:
     async with _client() as client:
         response = await client.get(f"{FLW_BASE_URL}/transactions/{transaction_id}/verify", headers=_headers())

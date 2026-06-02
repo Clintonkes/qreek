@@ -43,7 +43,7 @@ from database.models import PaymentEvent, PaymentLink, Transaction, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, initialize_checkout, query_transaction_fee, verify_transaction
+from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, initialize_checkout, query_transaction_fee, update_subaccount_split, verify_transaction
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
@@ -219,6 +219,13 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
     worker attempts subaccount creation; the rest pick up the created ID.
     """
     if link.flutterwave_subaccount_id:
+        # Ensure the subaccount's default split is correct (0.0025 for main) so the
+        # Flutterwave dashboard shows the right config for this sub. Per-tx override
+        # controls the actual split for payments.
+        try:
+            await update_subaccount_split(link.flutterwave_subaccount_id)
+        except Exception:
+            pass
         return
     # Re-fetch under a row-level lock so concurrent workers wait here and
     # the winner's result is visible to all subsequent readers.
@@ -286,6 +293,12 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             status=link.flutterwave_subaccount_status,
             payload={"link_id": link.id, "subaccount_id": link.flutterwave_subaccount_id, "flutterwave": data},
         )
+        # Best-effort: update the subaccount record's default split so dashboard shows correct 0.25% for Qreek.
+        # The per-tx override in checkout still controls the actual payment split.
+        try:
+            await update_subaccount_split(link.flutterwave_subaccount_id)
+        except Exception:
+            pass  # non-fatal
         await db.commit()
     except Exception as exc:
         link.flutterwave_subaccount_status = "failed"
@@ -539,6 +552,11 @@ async def create_link(
             status=link.flutterwave_subaccount_status,
             payload={"link_id": link.id, "subaccount_id": link.flutterwave_subaccount_id, "flutterwave": data},
         )
+        # Best-effort update of sub default split for correct dashboard display.
+        try:
+            await update_subaccount_split(link.flutterwave_subaccount_id)
+        except Exception:
+            pass
     except Exception as exc:
         link.flutterwave_subaccount_status = "failed"
         link.flutterwave_subaccount_error = str(exc)[:1000]
@@ -648,6 +666,14 @@ async def update_link(
 
     await db.commit()
 
+    # Always ensure sub default split is correct when editing the link (even without bank change).
+    # This corrects old subs that were created with wrong 0.9975.
+    if link.flutterwave_subaccount_id:
+        try:
+            await update_subaccount_split(link.flutterwave_subaccount_id)
+        except Exception:
+            pass
+
     # If bank changed, (re)create the subaccount now (like create_link does), using
     # correct split_value=0.0025. If this fails, link stays with status=failed and
     # subsequent pay will be rejected until you edit to a valid bank again.
@@ -684,6 +710,10 @@ async def update_link(
                 status=link.flutterwave_subaccount_status,
                 payload={"link_id": link.id, "subaccount_id": link.flutterwave_subaccount_id, "flutterwave": data},
             )
+            try:
+                await update_subaccount_split(link.flutterwave_subaccount_id)
+            except Exception:
+                pass
         except Exception as exc:
             link.flutterwave_subaccount_status = "failed"
             link.flutterwave_subaccount_error = str(exc)[:1000]
