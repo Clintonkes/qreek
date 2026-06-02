@@ -769,24 +769,21 @@ async def pay_link(
         payload={"recipient_amount": recipient_amount, "checkout_amount": checkout_amount, "qreek_fee": fee, "provider_fee_estimate": provider_fee_estimate, "platform_charge": platform_charge, "subaccount_id": link.flutterwave_subaccount_id},
     )
 
-    existing_result = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key).with_for_update())
+    # Idempotency lookup: only consider *in-flight* transactions for this key (pending/processing/payout_pending).
+    # Completed payments with the same key are ignored so that the same payer/details can initiate
+    # *new independent payments* on the reusable link (exactly like multiple deposits to the same
+    # bank account number). This fixes the "idempotent.recorded" for completed on retry of link
+    # (as seen in logs for QRK_LNK_C082F49D1F when retrying 907AD7CB with same profile details).
+    # The key is still used for deduping concurrent/retry of the *same* payment attempt.
+    # See also frontend change in PublicPayment.jsx (fresh key per submit, not sticky per phone/amount).
+    existing_result = await db.execute(
+        select(Transaction).where(
+            Transaction.idempotency_key == idempotency_key,
+            Transaction.status.in_(["pending", "processing", "payout_pending"])
+        ).with_for_update()
+    )
     existing = existing_result.scalar_one_or_none()
     if existing:
-        if existing.status in ("completed", "processing", "payout_pending"):
-            await log_payment_event(db, event_type="checkout.idempotent.recorded", reference=existing.reference, status=existing.status)
-            return {
-                "message": "Payment already recorded.",
-                "tx_ref": existing.tx_ref or existing.reference,
-                "reference": existing.reference,
-                "fee": existing.qreek_fee or existing.fee,
-                "net": existing.net_amount or existing.ngn_amount,
-                "recipient_amount": existing.net_amount or existing.ngn_amount,
-                "checkout_amount": existing.gross_amount or existing.amount,
-                "status": existing.status,
-                "payout_status": existing.payout_status,
-                "checkout_url": existing.provider_checkout_url,
-                "payment_url": existing.provider_checkout_url,
-            }
         if existing.provider_checkout_url:
             await log_payment_event(db, event_type="checkout.idempotent.reused_url", reference=existing.reference, status=existing.status)
             return {
