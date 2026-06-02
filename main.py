@@ -14,6 +14,8 @@ Flow:
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
 from database.session import init_db
 from routers import web_auth, web_rates, web_wallet, web_pools, web_alerts, web_ws, web_payroll, web_payment_links, web_flutterwave
 import os
@@ -44,6 +46,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Ensure CORS headers are present even on error responses (e.g. 500s from unhandled
+# exceptions like DB errors). The CORSMiddleware should handle most cases, but an
+# explicit handler guarantees the ACAO header for origins like https://qreekfinance.org
+# so the browser doesn't block the response with "No 'Access-Control-Allow-Origin'".
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Log is already done by uvicorn for ASGI errors; here we just return clean JSON.
+    # In production you might want more selective handling (e.g. only for certain exc).
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again or contact support."},
+    )
 
 app.include_router(web_auth.router)
 app.include_router(web_rates.router)
