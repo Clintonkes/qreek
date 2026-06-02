@@ -18,8 +18,6 @@ import logging
 import os
 from typing import Optional
 
-import httpx
-
 from services.payment_event_logger import log_payment_event
 
 logger = logging.getLogger(__name__)
@@ -80,6 +78,8 @@ async def send_sms(
             )
         return False
 
+    # Lazy import so bare python / tests without the project venv can still import the module for syntax.
+    import httpx
     payload = {
         "api_key": TERMII_API_KEY,
         "to": norm_phone,
