@@ -48,15 +48,17 @@ from services.sms_service import send_link_payment_received_sms, send_payment_re
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
-FEE_PCT = 0.0025  # 0.25% for direct payment links
+FEE_PCT = 0.0025  # 0.25% default for personal (non-pool) payment links
+POOL_FEE_PCT = 0.0015  # 0.15% for pool collection links (as specified for pooling pattern)
 
 
-async def _checkout_total_for_recipient(recipient_amount: float) -> tuple[float, float, float]:
+async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float = FEE_PCT) -> tuple[float, float, float]:
     """
     Builds a one-time payer total where the link owner receives the requested
     amount and Qreek's fee is added on top of that amount.
+    fee_pct: 0.0025 for personal links, 0.0015 for pool collection links.
     """
-    qreek_fee = round(recipient_amount * FEE_PCT, 2)
+    qreek_fee = round(recipient_amount * fee_pct, 2)
     checkout_amount = round(recipient_amount + qreek_fee, 2)
     provider_fee = 0.0
     for _ in range(2):
@@ -74,6 +76,7 @@ class CreateLinkIn(BaseModel):
     max_uses:     Optional[int] = None
     expires_days: Optional[int] = None
     provider:     Optional[str] = "flutterwave"
+    pool_id:      Optional[str] = None  # if set, this is a pool collection link (0.15% fee, tied to pool for history)
 
 
 class PayLinkIn(BaseModel):
@@ -158,6 +161,7 @@ def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
         "is_active": l.is_active,
         "created_at": l.created_at.isoformat() if l.created_at else None,
         "url": f"https://qreekfinance.org/p/{l.code}",
+        "pool_id": l.pool_id,  # present for pool collection links (0.15% fee, public ledger, auto expire delete)
     }
     if show_bank:
         d["bank_account"] = "****" + l.bank_account[-4:] if l.bank_account else None
@@ -205,6 +209,10 @@ async def _get_live_link(db: AsyncSession, code: str) -> PaymentLink:
         raise HTTPException(status_code=404, detail="Payment link not found.")
     if link.expires_at and link.expires_at < datetime.utcnow():
         await log_payment_event(db, event_type="link.resolve.expired", reference=code, status="failed")
+        # Auto-delete pool collection links on expire (records/tx stay via source or refs; personal links stay for history)
+        if link.pool_id:
+            await db.delete(link)
+            await db.commit()
         raise HTTPException(status_code=410, detail="This payment link has expired.")
     if link.max_uses and link.use_count >= link.max_uses:
         await log_payment_event(db, event_type="link.resolve.max_uses", reference=code, status="failed")
@@ -282,6 +290,7 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             select(UserSecurity).where(UserSecurity.phone == link.created_by)
         )
         security = security_result.scalar_one_or_none()
+        sub_split_value = POOL_FEE_PCT if link.pool_id else 0.0025
         subaccount = await create_collection_subaccount(
             account_bank=link.bank_code,
             account_number=link.bank_account,
@@ -289,7 +298,7 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             business_mobile=link.created_by,
             business_email=security.recovery_email if security else None,
             split_type="percentage",
-            split_value=0.0025,  # main/Qreek commission 0.25%; sub (user) gets remainder. See also tx override in pay_link.
+            split_value=sub_split_value,  # 0.15% pool / 0.25% personal; tx override in pay_link wins for exact.
         )
         data = subaccount.get("data", {})
         # Prefer the RS_ code (data.subaccount_id) for flutterwave_subaccount_id because that is what
@@ -534,11 +543,19 @@ async def create_link(
             PaymentLink.pool_id.is_(None)
         )
     )
-    if existing_link_result.scalars().first():
+    if existing_link_result.scalars().first() and not body.pool_id:
         raise HTTPException(
             status_code=400,
             detail="You already have an active personal payment link. Please edit your existing link's bank details instead of creating a new one."
         )
+
+    # For pool collection links: validate creator is admin of the FiatPool
+    target_pool_id = body.pool_id
+    if target_pool_id:
+        fpr = await db.execute(select(FiatPool).where(FiatPool.id == target_pool_id, FiatPool.creator_phone == phone))
+        if not fpr.scalar_one_or_none():
+            # allow if member? but for creating collection link, require admin/creator for the destination bank
+            raise HTTPException(status_code=403, detail="Only the pool creator/admin can create collection links for a pool.")
 
     if not body.description.strip():
         raise HTTPException(status_code=400, detail="Description is required.")
@@ -563,6 +580,7 @@ async def create_link(
         bank_name=bank["name"],
         max_uses=body.max_uses,
         expires_at=expires_at,
+        pool_id=target_pool_id,  # pool collection link if set; enables 0.15% fee + public history on checkout + auto-delete on expire
     )
     db.add(link)
     await db.commit()
@@ -573,12 +591,13 @@ async def create_link(
     )
     creator_security = creator_security_result.scalar_one_or_none()
 
+    sub_split_value = POOL_FEE_PCT if target_pool_id else 0.0025
     try:
         await log_payment_event(
             db,
             event_type="flutterwave.subaccount.create.started",
             status="started",
-            payload={"link_id": link.id, "bank_code": body.bank_code, "account_number_last4": body.bank_account[-4:]},
+            payload={"link_id": link.id, "bank_code": body.bank_code, "account_number_last4": body.bank_account[-4:], "is_pool": bool(target_pool_id)},
         )
         subaccount = await create_collection_subaccount(
             account_bank=body.bank_code,
@@ -587,7 +606,7 @@ async def create_link(
             business_mobile=phone,
             business_email=creator_security.recovery_email if creator_security else None,
             split_type="percentage",
-            split_value=0.0025,  # main/Qreek 0.25% commission (the value on sub record is *main's* share per FW docs). Override at pay time + edit support ensures correct split behaviour even for old links.
+            split_value=sub_split_value,  # 0.15% for pool links, 0.25% default; tx override at pay time always controls the exact flat fee for this collection.
         )
         data = subaccount.get("data", {})
         # Prefer the RS_ code (data.subaccount_id) for flutterwave_subaccount_id because that is what
@@ -726,16 +745,15 @@ async def update_link(
 
     await db.commit()
 
-    # Always push current link.title as business_name + ensure split=0.0025 on the sub record.
-    # This makes "I edited the name of the link" actually appear on the Flutterwave subaccount dashboard
-    # (previously only split was updated; name was only set at initial sub create).
-    # Even for title-only edits (no bank change) we now call the general updater.
+    # Always push current link.title as business_name + correct split (0.15% pool collection vs 0.25% personal).
+    # This makes "I edited the name of the link" actually appear on the Flutterwave subaccount dashboard.
     if link.flutterwave_subaccount_id:
         try:
+            sv = POOL_FEE_PCT if link.pool_id else 0.0025
             await update_subaccount(
                 link.flutterwave_subaccount_id,
                 business_name=link.title,
-                # split_type/split_value default to 0.0025 inside the updater
+                split_value=sv,
             )
         except Exception:
             pass
@@ -755,6 +773,7 @@ async def update_link(
                 status="started",
                 payload={"link_id": link.id, "bank_code": new_bank_code, "account_number_last4": (new_bank_account or "")[-4:]},
             )
+            sub_split_value = POOL_FEE_PCT if link.pool_id else 0.0025
             subaccount = await create_collection_subaccount(
                 account_bank=new_bank_code,
                 account_number=new_bank_account,
@@ -762,7 +781,7 @@ async def update_link(
                 business_mobile=phone,
                 business_email=creator_security.recovery_email if creator_security else None,
                 split_type="percentage",
-                split_value=0.0025,
+                split_value=sub_split_value,
             )
             data = subaccount.get("data", {})
             sub_id = data.get("subaccount_id") or data.get("id")
@@ -867,9 +886,30 @@ async def resolve_link(code: str, db: AsyncSession = Depends(get_db)):
     """
     Public endpoint to view a payment link by its unique code.
     Validates that the link exists, is active, has not expired, and has not reached max uses.
+    For pool collection links (link.pool_id), includes recent_contributions so the public
+    checkout page can show live ledger (who paid, when, how much, running context) as requested.
     """
     link = await _get_live_link(db, code)
-    return {"link": _link_dict(link)}
+    resp = {"link": _link_dict(link)}
+    if link.pool_id:
+        # Public view of recent payments into this pool link (for transparency on checkout page)
+        txs_res = await db.execute(
+            select(Transaction).where(
+                Transaction.pool_id == link.id,
+                Transaction.tx_type == "payment_link",
+            ).order_by(desc(Transaction.created_at)).limit(15)
+        )
+        recent = []
+        for t in txs_res.scalars().all():
+            recent.append({
+                "date": t.created_at.isoformat() if t.created_at else None,
+                "payer": (t.payer_name or (t.payer_phone or "Anonymous")[:8] + "..."),
+                "amount": t.net_amount or t.ngn_amount or t.amount,
+                "reference": t.reference,
+            })
+        resp["recent_contributions"] = recent
+        resp["pool_total_via_link"] = link.total_collected or 0
+    return resp
 
 
 @router.post("/pay/{code}")
@@ -906,7 +946,9 @@ async def pay_link(
     if not payment_description:
         raise HTTPException(status_code=400, detail="Payment description is required.")
 
-    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(recipient_amount)
+    # tx override + fee: use 0.15% for pool collection links (link.pool_id set), 0.25% for personal
+    link_fee_pct = POOL_FEE_PCT if link.pool_id else FEE_PCT
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(recipient_amount, fee_pct=link_fee_pct)
     platform_charge = round(checkout_amount - recipient_amount, 2)
     idempotency_key = body.idempotency_key or f"{code.upper()}:{body.phone or body.payer_phone or 'anon'}:{recipient_amount}:{payment_description}"
     await log_payment_event(
@@ -987,7 +1029,8 @@ async def pay_link(
             payment_description=payment_description,
             payer_name=payer_name,
             payer_phone=payer_phone,
-            pool_id=link.id,
+            pool_id=link.id,  # PaymentLink.id for per-link settlements / finalize lookup
+            source_pool_id=link.pool_id,  # the actual pool id, for pool history even after link auto-delete on expire
             bank_account=link.bank_account,
             bank_code=link.bank_code,
             bank_name=link.bank_name,

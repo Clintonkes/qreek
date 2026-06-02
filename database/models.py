@@ -95,6 +95,7 @@ class Transaction(Base):
     bank_name       = Column(String, nullable=True)
     escrow_address  = Column(String, nullable=True)
     monitoring_id   = Column(String, nullable=True)
+    source_pool_id  = Column(String, nullable=True)  # for pool collection links: the actual FiatPool.id so history survives link auto-delete on expire
     created_at      = Column(DateTime, default=datetime.utcnow)
 
 
