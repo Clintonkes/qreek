@@ -69,6 +69,8 @@ async def _ensure_ledger_columns(conn):
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_checkout_url VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_description VARCHAR",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payer_name VARCHAR",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payer_phone VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payout_status VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payout_reference VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payout_error TEXT",

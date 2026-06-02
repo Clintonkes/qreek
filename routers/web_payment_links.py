@@ -43,7 +43,8 @@ from database.models import PaymentEvent, PaymentLink, Transaction, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, initialize_checkout, query_transaction_fee, update_subaccount_split, verify_transaction
+from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, initialize_checkout, query_transaction_fee, update_subaccount, update_subaccount_split, verify_transaction
+from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
@@ -137,6 +138,8 @@ def _payment_dict(tx: Transaction) -> dict:
         "payout_reference": tx.payout_reference,
         "created_at": tx.created_at.isoformat() if tx.created_at else None,
         "payment_description": tx.payment_description,
+        "payer_name": tx.payer_name,
+        "payer_phone": tx.payer_phone,
     }
 
 
@@ -198,10 +201,13 @@ async def _get_live_link(db: AsyncSession, code: str) -> PaymentLink:
     result = await db.execute(select(PaymentLink).where(PaymentLink.code == code.upper()))
     link = result.scalar_one_or_none()
     if not link or not link.is_active:
+        await log_payment_event(db, event_type="link.resolve.not_found_or_inactive", reference=code, status="failed")
         raise HTTPException(status_code=404, detail="Payment link not found.")
     if link.expires_at and link.expires_at < datetime.utcnow():
+        await log_payment_event(db, event_type="link.resolve.expired", reference=code, status="failed")
         raise HTTPException(status_code=410, detail="This payment link has expired.")
     if link.max_uses and link.use_count >= link.max_uses:
+        await log_payment_event(db, event_type="link.resolve.max_uses", reference=code, status="failed")
         raise HTTPException(status_code=410, detail="Maximum uses reached.")
     return link
 
@@ -227,7 +233,7 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
         # Flutterwave dashboard shows the right config for this sub. Per-tx override
         # controls the actual split for payments.
         try:
-            await update_subaccount_split(link.flutterwave_subaccount_id)
+            await update_subaccount(link.flutterwave_subaccount_id)
         except Exception:
             pass
         return
@@ -309,7 +315,7 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
         # Best-effort: update the subaccount record's default split so dashboard shows correct 0.25% for Qreek.
         # The per-tx override in checkout still controls the actual payment split.
         try:
-            await update_subaccount_split(link.flutterwave_subaccount_id)
+            await update_subaccount(link.flutterwave_subaccount_id)
         except Exception:
             pass  # non-fatal
         await db.commit()
@@ -328,7 +334,8 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             payload=error_payload,
         )
         await db.commit()
-        raise HTTPException(status_code=502, detail="Could not prepare recipient settlement account. Check Railway payment_event logs for Flutterwave's subaccount response.")
+        await log_payment_event(db, event_type="link.subaccount.ensure.failed_hard", reference=link.code, status="failed", message=str(exc)[:300])
+        raise HTTPException(status_code=502, detail="We couldn't set up your bank account for payments. Edit the link and try saving again.")
 
 
 async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, transaction_id: str | int = None) -> dict:
@@ -447,6 +454,34 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
             },
         )
         await db.commit()
+
+        # Realtime SMS notifications to phones the moment payment succeeds (owner alert + payer receipt).
+        # Called only on the verified split_settlement happy path (after commit).
+        # Both functions are best-effort and log their own payment_event (sent/skipped/failed).
+        # If no TERMII_API_KEY, they still create events and app logs (no external send).
+        # This satisfies "realtime messaging to the phone numbers of users the moment they make payments".
+        try:
+            await send_link_payment_received_sms(
+                owner_phone=link.created_by,
+                link_title=link.title or "Qreek link",
+                amount=recipient_amount,
+                reference=tx_ref,
+                payer_name=getattr(tx, "payer_name", None),
+                db=db,
+            )
+            if getattr(tx, "payer_phone", None):
+                await send_payment_receipt_sms(
+                    payer_phone=tx.payer_phone,
+                    link_title=link.title or "Qreek link",
+                    amount=recipient_amount,
+                    reference=tx_ref,
+                    owner_bank_name=link.bank_name,
+                    db=db,
+                )
+        except Exception:
+            # SMS must never affect the payment confirmation path or raise to caller.
+            pass
+
         return {"payment": _payment_dict(tx)}
 
     # No subaccount configured for this link payment (should be prevented at pay time for new flows).
@@ -471,6 +506,7 @@ async def create_link(
     Validates the bank details and sets an optional expiration date.
     """
     phone = claims["phone"]
+    await log_payment_event(db, event_type="link.create.started", status="started", payload={"has_bank": bool(body.bank_code and body.bank_account)})
 
     # ERROR (this + missing update pre-fix): This guard (one active personal/non-pool link per user)
     # + the error message promising edit, but no PUT handler existed until now. Result: to test
@@ -576,7 +612,7 @@ async def create_link(
         )
         # Best-effort update of sub default split for correct dashboard display.
         try:
-            await update_subaccount_split(link.flutterwave_subaccount_id)
+            await update_subaccount(link.flutterwave_subaccount_id)
         except Exception:
             pass
     except Exception as exc:
@@ -595,6 +631,7 @@ async def create_link(
         )
     await db.commit()
     await db.refresh(link)
+    await log_payment_event(db, event_type="link.create.completed", reference=link.code, status="success", payload={"link_id": link.id, "sub_id": link.flutterwave_subaccount_id})
     return {"link": _link_dict(link, show_bank=True)}
 
 
@@ -638,6 +675,7 @@ async def update_link(
     user money to their stored bank via sub settlement). Unique link preserved.
     """
     phone = claims["phone"]
+    await log_payment_event(db, event_type="link.update.started", status="started", payload={"link_id": link_id, "has_title": body.title is not None, "has_bank": bool(body.bank_code or body.bank_account)})
 
     result = await db.execute(
         select(PaymentLink)
@@ -688,11 +726,17 @@ async def update_link(
 
     await db.commit()
 
-    # Always ensure sub default split is correct when editing the link (even without bank change).
-    # This corrects old subs that were created with wrong 0.9975.
+    # Always push current link.title as business_name + ensure split=0.0025 on the sub record.
+    # This makes "I edited the name of the link" actually appear on the Flutterwave subaccount dashboard
+    # (previously only split was updated; name was only set at initial sub create).
+    # Even for title-only edits (no bank change) we now call the general updater.
     if link.flutterwave_subaccount_id:
         try:
-            await update_subaccount_split(link.flutterwave_subaccount_id)
+            await update_subaccount(
+                link.flutterwave_subaccount_id,
+                business_name=link.title,
+                # split_type/split_value default to 0.0025 inside the updater
+            )
         except Exception:
             pass
 
@@ -733,7 +777,7 @@ async def update_link(
                 payload={"link_id": link.id, "subaccount_id": link.flutterwave_subaccount_id, "flutterwave": data},
             )
             try:
-                await update_subaccount_split(link.flutterwave_subaccount_id)
+                await update_subaccount(link.flutterwave_subaccount_id, business_name=link.title)
             except Exception:
                 pass
         except Exception as exc:
@@ -753,6 +797,7 @@ async def update_link(
         await db.commit()
         await db.refresh(link)
 
+    await log_payment_event(db, event_type="link.update.completed", reference=link.code, status="success", payload={"title_updated": body.title is not None, "bank_changed": bank_changed})
     return {"link": _link_dict(link, show_bank=True)}
 
 
@@ -838,6 +883,7 @@ async def pay_link(
     The payer can complete with card, bank transfer, or any method enabled on Flutterwave.
     """
     link = await _get_live_link(db, code)
+    await log_payment_event(db, event_type="link.pay.started", reference=code, status="started", payload={"has_idempotency": bool(body.idempotency_key)})
     await _ensure_link_subaccount(db, link)
 
     # ERROR (pre-fix): after _ensure, pay proceeded even if no flutterwave_subaccount_id
@@ -847,9 +893,10 @@ async def pay_link(
     # one-and-only personal link (per create_link:441) to a test bank -> sub recreated with
     # good config -> pay -> split at success. No new link per test, no transfer fallback.
     if not link.flutterwave_subaccount_id:
+        await log_payment_event(db, event_type="pay.subaccount.missing", reference=code, status="failed")
         raise HTTPException(
             status_code=502,
-            detail="Recipient subaccount split not configured for this link (previous creation failed or bank not set). Edit the link's bank details to trigger subaccount creation with correct split, then retry. See payment_event logs for details.",
+            detail="We couldn't prepare this link for receiving payments right now. Please edit the bank details on the link and try again.",
         )
 
     recipient_amount = link.amount if not link.is_flexible else body.amount
@@ -938,6 +985,8 @@ async def pay_link(
             tx_ref=ref,
             idempotency_key=idempotency_key,
             payment_description=payment_description,
+            payer_name=payer_name,
+            payer_phone=payer_phone,
             pool_id=link.id,
             bank_account=link.bank_account,
             bank_code=link.bank_code,
@@ -1132,14 +1181,17 @@ async def deactivate_link(
     Deactivates a payment link, making it unavailable for future payments.
     """
     phone  = claims["phone"]
+    await log_payment_event(db, event_type="link.delete.started", status="started", payload={"link_id": link_id})
     result = await db.execute(
         select(PaymentLink).where(PaymentLink.id == link_id, PaymentLink.created_by == phone)
     )
     link = result.scalar_one_or_none()
     if not link:
+        await log_payment_event(db, event_type="link.delete.not_found", status="failed")
         raise HTTPException(status_code=404, detail="Link not found.")
     # Hard delete so deactivated links are completely removed and not visible in dashboard (as requested).
     # Historical transactions referencing the link via pool_id remain for records.
     await db.delete(link)
     await db.commit()
+    await log_payment_event(db, event_type="link.delete.completed", status="success", payload={"link_id": link_id})
     return {"message": "Payment link deleted."}

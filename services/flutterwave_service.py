@@ -219,24 +219,19 @@ async def get_subaccount(subaccount_id: str) -> dict:
         return response.json().get("data")
 
 
-async def update_subaccount_split(
+async def update_subaccount(
     subaccount_id: str,
-    split_type: str = "percentage",
-    split_value: float = 0.0025,
+    split_type: Optional[str] = "percentage",
+    split_value: Optional[float] = 0.0025,
+    business_name: Optional[str] = None,
 ) -> dict:
     """
-    Updates an existing subaccount's default split config so that the subaccount
-    record on the Flutterwave dashboard reflects the correct split (main gets 0.25%).
-    The per-tx override in checkout still takes precedence for individual payments.
-    ERROR (pre-fix): get_subaccount did direct GET /subaccounts/RS_... (which expects numeric data.id);
-    on failure returned None so update_id stayed "RS_..." -> PUT /subaccounts/RS_... -> "Merchant not found".
-    Also insufficient fields in payload for some update validations.
-    FIX (this file): get_subaccount special-cases RS_ by listing + match on "subaccount_id" to return
-    the full item (with numeric "id"); then we set update_id = numeric and include carried fields
-    (business_*, account_*) from the fetched sub. See calls from _ensure/create/update in web_payment_links.py.
-    System behaviour with fix: edit link (bank or not) or pay will best-effort PUT the numeric id with
-    split_value=0.0025; no more merchant-not-found; dashboard sub record shows correct split (tx override
-    guarantees the 0.25% anyway).
+    General updater for a collection subaccount (split config + business_name etc).
+    - Resolves RS_ code -> numeric id via list (prevents "Merchant not found" on PUT path).
+    - Carries over core fields from the fetched sub record (required by some FW update validations).
+    - Used both for split correction (0.0025) and for propagating link.title -> sub business_name
+      so that "edit name" on link actually updates what shows in the Flutterwave dashboard.
+    The per-tx subaccounts[] override in checkout still wins for the actual payment split.
     """
     update_id = subaccount_id
     sub = None
@@ -245,15 +240,22 @@ async def update_subaccount_split(
         sub = await get_subaccount(subaccount_id)
         if sub and sub.get("id"):
             update_id = sub["id"]
-    payload = {
-        "split_type": split_type,
-        "split_value": split_value,
-    }
+    payload: dict = {}
+    if split_type is not None:
+        payload["split_type"] = split_type
+    if split_value is not None:
+        payload["split_value"] = split_value
+    if business_name:
+        payload["business_name"] = business_name[:100]
     if sub:
         # carry over fields that update may require/validate to avoid merchant/validation errors
         for k in ("business_name", "business_email", "business_mobile", "account_bank", "account_number", "country"):
-            if k in sub:
+            if k in sub and k not in payload:
                 payload[k] = sub[k]
+    # If we are only updating name, still make sure we send a split (FW may expect it on some accounts)
+    if "split_type" not in payload and sub:
+        payload["split_type"] = sub.get("split_type", "percentage")
+        payload["split_value"] = sub.get("split_value", 0.0025)
     async with _client() as client:
         response = await client.put(
             f"{FLW_BASE_URL}/subaccounts/{update_id}",
@@ -263,10 +265,19 @@ async def update_subaccount_split(
         if response.is_error:
             # Don't fail the payment if update fails; override at tx time is what matters.
             # (See pay_link subaccounts override + finalize always-split path.)
-            logger.warning("Failed to update subaccount %s split: %s", subaccount_id, response.text[:300])
+            logger.warning("Failed to update subaccount %s: %s", subaccount_id, response.text[:300])
             return {"status": "error", "message": response.text[:500]}
         response.raise_for_status()
         return response.json()
+
+
+async def update_subaccount_split(
+    subaccount_id: str,
+    split_type: str = "percentage",
+    split_value: float = 0.0025,
+) -> dict:
+    """Backward-compat wrapper (used by existing call sites in web_payment_links)."""
+    return await update_subaccount(subaccount_id, split_type=split_type, split_value=split_value)
 
 
 async def verify_transaction(transaction_id: str | int) -> dict:

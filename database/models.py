@@ -83,6 +83,8 @@ class Transaction(Base):
     idempotency_key = Column(String, nullable=True)
     provider_checkout_url = Column(String, nullable=True)
     payment_description = Column(String, nullable=True)
+    payer_name      = Column(String, nullable=True)
+    payer_phone     = Column(String, nullable=True)
     payout_status = Column(String, nullable=True)
     payout_reference = Column(String, nullable=True)
     payout_error = Column(Text, nullable=True)
