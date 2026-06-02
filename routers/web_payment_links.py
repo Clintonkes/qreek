@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, or_
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import Optional
 
@@ -769,18 +770,18 @@ async def pay_link(
         payload={"recipient_amount": recipient_amount, "checkout_amount": checkout_amount, "qreek_fee": fee, "provider_fee_estimate": provider_fee_estimate, "platform_charge": platform_charge, "subaccount_id": link.flutterwave_subaccount_id},
     )
 
-    # Idempotency lookup: only consider *in-flight* transactions for this key (pending/processing/payout_pending).
-    # Completed payments with the same key are ignored so that the same payer/details can initiate
-    # *new independent payments* on the reusable link (exactly like multiple deposits to the same
-    # bank account number). This fixes the "idempotent.recorded" for completed on retry of link
-    # (as seen in logs for QRK_LNK_C082F49D1F when retrying 907AD7CB with same profile details).
-    # The key is still used for deduping concurrent/retry of the *same* payment attempt.
-    # See also frontend change in PublicPayment.jsx (fresh key per submit, not sticky per phone/amount).
+    # Proper idempotency: the provided key is tied to *one specific transaction/attempt* (1:1 with a tx ref).
+    # Lookup *any* tx with this exact key (the unique constraint "ux_transactions_idempotency_key" enforces this).
+    # If exists: return the existing tx's data (idempotent - whether it's a pending checkout to reuse,
+    # or a completed one). This prevents duplicate tx creation for the same client key.
+    # If the client sends a *fresh* key (as the updated frontend now does on every pay submit),
+    # a new independent payment tx is created on the link -- exactly like multiple deposits
+    # to one bank account number. The key is *not* "to the activity of the link" but to one tx.
+    # See user note and frontend: always fresh crypto.randomUUID() per submit (no more sticky per phone/amount).
+    # Old clients sending a previously-used key will get the previous tx's status (gracefully handled
+    # in frontend to show receipt instead of error), but won't cause 500/unique violation.
     existing_result = await db.execute(
-        select(Transaction).where(
-            Transaction.idempotency_key == idempotency_key,
-            Transaction.status.in_(["pending", "processing", "payout_pending"])
-        ).with_for_update()
+        select(Transaction).where(Transaction.idempotency_key == idempotency_key).with_for_update()
     )
     existing = existing_result.scalar_one_or_none()
     if existing:
@@ -797,7 +798,21 @@ async def pay_link(
                 "recipient_amount": existing.net_amount or existing.ngn_amount,
                 "checkout_amount": existing.gross_amount or existing.amount,
             }
-        ref = existing.reference
+        # even for completed/failed: return recorded status (idempotent), no new tx
+        await log_payment_event(db, event_type="checkout.idempotent.recorded", reference=existing.reference, status=existing.status)
+        return {
+            "message": "Payment already recorded.",
+            "tx_ref": existing.tx_ref or existing.reference,
+            "reference": existing.reference,
+            "fee": existing.qreek_fee or existing.fee,
+            "net": existing.net_amount or existing.ngn_amount,
+            "recipient_amount": existing.net_amount or existing.ngn_amount,
+            "checkout_amount": existing.gross_amount or existing.amount,
+            "status": existing.status,
+            "payout_status": existing.payout_status,
+            "checkout_url": existing.provider_checkout_url,
+            "payment_url": existing.provider_checkout_url,
+        }
     else:
         ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
 
@@ -829,8 +844,19 @@ async def pay_link(
             bank_name=link.bank_name,
         )
         db.add(tx)
-        await db.commit()
-        await log_payment_event(db, event_type="checkout.transaction.created", reference=ref, status="pending", payload={"checkout_amount": checkout_amount, "recipient_amount": recipient_amount, "qreek_fee": fee, "provider_fee_estimate": provider_fee_estimate, "platform_charge": platform_charge, "subaccount_id": link.flutterwave_subaccount_id})
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Race: another request with the exact same fresh idempotency_key created the tx first.
+            # Rollback and fetch the winner's tx (idempotent behaviour).
+            await db.rollback()
+            existing_result = await db.execute(
+                select(Transaction).where(Transaction.idempotency_key == idempotency_key)
+            )
+            tx = existing_result.scalar_one()
+            ref = tx.reference
+        else:
+            await log_payment_event(db, event_type="checkout.transaction.created", reference=ref, status="pending", payload={"checkout_amount": checkout_amount, "recipient_amount": recipient_amount, "qreek_fee": fee, "provider_fee_estimate": provider_fee_estimate, "platform_charge": platform_charge, "subaccount_id": link.flutterwave_subaccount_id})
     else:
         tx = existing
 
