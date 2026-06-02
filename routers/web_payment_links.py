@@ -33,7 +33,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, or_
+from sqlalchemy import select, desc, or_, func
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import Optional
@@ -118,6 +118,8 @@ def _payment_dict(tx: Transaction) -> dict:
     """
     Returns the public payment status shape used by checkout redirects and
     polling. A transaction is only complete after recipient settlement succeeds.
+    Added created_at + payment_description so the Settlements table (PaymentLinks.jsx)
+    can show Date and the details View has more tx info (not just events).
     """
     return {
         "reference": tx.reference,
@@ -133,6 +135,8 @@ def _payment_dict(tx: Transaction) -> dict:
         "provider_transaction_id": tx.provider_transaction_id,
         "payout_status": tx.payout_status,
         "payout_reference": tx.payout_reference,
+        "created_at": tx.created_at.isoformat() if tx.created_at else None,
+        "payment_description": tx.payment_description,
     }
 
 
@@ -282,10 +286,19 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             split_value=0.0025,  # main/Qreek commission 0.25%; sub (user) gets remainder. See also tx override in pay_link.
         )
         data = subaccount.get("data", {})
-        sub_id = data.get("subaccount_id") or data.get("id")
-        link.flutterwave_subaccount_id = str(sub_id) if sub_id else None
+        # Prefer the RS_ code (data.subaccount_id) for flutterwave_subaccount_id because that is what
+        # goes into checkout subaccounts[{"id": "..."}] and what user sees in FW. Numeric data.id is
+        # only for management (update/delete/fetch single). See update_subaccount_split fix in
+        # services/flutterwave_service.py which now resolves RS_ via list+match to avoid "Merchant not found".
+        rs_id = data.get("subaccount_id") or data.get("id")
+        numeric_id = data.get("id")
+        link.flutterwave_subaccount_id = str(rs_id) if rs_id else None
         link.flutterwave_subaccount_status = "active" if link.flutterwave_subaccount_id else "missing_id"
         link.flutterwave_subaccount_error = None if link.flutterwave_subaccount_id else str(subaccount)[:1000]
+        if numeric_id:
+            # best-effort: stash numeric in error field only if no real error (for future; harmless, visible in debug)
+            if not link.flutterwave_subaccount_error:
+                link.flutterwave_subaccount_error = f"numeric_id={numeric_id}"  # overwritten on real error; used by update resolver if needed later
         await log_payment_event(
             db,
             event_type="flutterwave.subaccount.ensure.completed",
@@ -541,10 +554,19 @@ async def create_link(
             split_value=0.0025,  # main/Qreek 0.25% commission (the value on sub record is *main's* share per FW docs). Override at pay time + edit support ensures correct split behaviour even for old links.
         )
         data = subaccount.get("data", {})
-        sub_id = data.get("subaccount_id") or data.get("id")
-        link.flutterwave_subaccount_id = str(sub_id) if sub_id else None
+        # Prefer the RS_ code (data.subaccount_id) for flutterwave_subaccount_id because that is what
+        # goes into checkout subaccounts[{"id": "..."}] and what user sees in FW. Numeric data.id is
+        # only for management (update/delete/fetch single). See update_subaccount_split fix in
+        # services/flutterwave_service.py which now resolves RS_ via list+match to avoid "Merchant not found".
+        rs_id = data.get("subaccount_id") or data.get("id")
+        numeric_id = data.get("id")
+        link.flutterwave_subaccount_id = str(rs_id) if rs_id else None
         link.flutterwave_subaccount_status = "active" if link.flutterwave_subaccount_id else "missing_id"
         link.flutterwave_subaccount_error = None if link.flutterwave_subaccount_id else str(subaccount)[:1000]
+        if numeric_id:
+            # best-effort: stash numeric in error field only if no real error (for future; harmless, visible in debug)
+            if not link.flutterwave_subaccount_error:
+                link.flutterwave_subaccount_error = f"numeric_id={numeric_id}"  # overwritten on real error; used by update resolver if needed later
         await log_payment_event(
             db,
             event_type="flutterwave.subaccount.create.completed",
@@ -741,10 +763,58 @@ async def list_links(claims: dict = Depends(decode_token), db: AsyncSession = De
     """
     phone  = claims["phone"]
     result = await db.execute(
-        select(PaymentLink).where(PaymentLink.created_by == phone).order_by(desc(PaymentLink.created_at)).limit(50)
+        select(PaymentLink).where(PaymentLink.created_by == phone, PaymentLink.is_active == True).order_by(desc(PaymentLink.created_at)).limit(50)
     )
     links = result.scalars().all()
     return {"links": [_link_dict(l, show_bank=True) for l in links]}
+
+
+@router.get("/{link_id}/settlements")
+async def get_link_settlements(
+    link_id: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+    page: int = 1,
+    per_page: int = 10,
+):
+    """
+    List all payments (transactions) received via this payment link, for the "Settlements"
+    view in dashboard. Returns paginated list (10 per page), with full payment dicts.
+    Includes action "view" on frontend to see details (e.g. full events or tx).
+    """
+    phone = claims["phone"]
+    link_result = await db.execute(
+        select(PaymentLink).where(PaymentLink.id == link_id, PaymentLink.created_by == phone)
+    )
+    link = link_result.scalar_one_or_none()
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found.")
+
+    base_query = select(Transaction).where(
+        Transaction.pool_id == link_id,
+        Transaction.tx_type == "payment_link",
+    ).order_by(desc(Transaction.created_at))
+
+    # total count
+    count_result = await db.execute(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.pool_id == link_id,
+            Transaction.tx_type == "payment_link",
+        )
+    )
+    total = count_result.scalar_one() or 0
+
+    offset = (page - 1) * per_page
+    result = await db.execute(base_query.offset(offset).limit(per_page))
+    txs = result.scalars().all()
+
+    return {
+        "payments": [_payment_dict(tx) for tx in txs],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": (total + per_page - 1) // per_page if per_page else 1,
+    }
 
 
 @router.get("/resolve/{code}")
@@ -1068,6 +1138,8 @@ async def deactivate_link(
     link = result.scalar_one_or_none()
     if not link:
         raise HTTPException(status_code=404, detail="Link not found.")
-    link.is_active = False
+    # Hard delete so deactivated links are completely removed and not visible in dashboard (as requested).
+    # Historical transactions referencing the link via pool_id remain for records.
+    await db.delete(link)
     await db.commit()
-    return {"message": "Payment link deactivated."}
+    return {"message": "Payment link deleted."}

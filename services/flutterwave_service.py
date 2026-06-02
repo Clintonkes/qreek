@@ -192,6 +192,33 @@ async def create_collection_subaccount(
         return response.json()
 
 
+async def get_subaccount(subaccount_id: str) -> dict:
+    """
+    Fetch a subaccount. If given an RS_... subaccount_id (the code used for splits),
+    we list all and match by subaccount_id (because single-fetch GET /subaccounts/{id}
+    expects the *numeric* data.id per FW docs). Returns the item dict which includes
+    both "id" (numeric, for update path) and "subaccount_id".
+    This fixes "Merchant not found" on update when we only had the RS_ code stored.
+    """
+    sid = str(subaccount_id or "")
+    async with _client() as client:
+        if sid.startswith("RS_"):
+            # List and match — single GET /subaccounts/RS_... fails (expects numeric)
+            resp = await client.get(f"{FLW_BASE_URL}/subaccounts", headers=_headers())
+            if resp.is_error:
+                logger.warning("List subaccounts failed for RS lookup: %s", resp.text[:200])
+                return None
+            for item in (resp.json().get("data") or []):
+                if item.get("subaccount_id") == sid:
+                    return item
+            return None
+        # numeric id path
+        response = await client.get(f"{FLW_BASE_URL}/subaccounts/{sid}", headers=_headers())
+        if response.is_error:
+            return None
+        return response.json().get("data")
+
+
 async def update_subaccount_split(
     subaccount_id: str,
     split_type: str = "percentage",
@@ -201,21 +228,41 @@ async def update_subaccount_split(
     Updates an existing subaccount's default split config so that the subaccount
     record on the Flutterwave dashboard reflects the correct split (main gets 0.25%).
     The per-tx override in checkout still takes precedence for individual payments.
-    Uses the subaccount_id (RS_...) or numeric id.
+    ERROR (pre-fix): get_subaccount did direct GET /subaccounts/RS_... (which expects numeric data.id);
+    on failure returned None so update_id stayed "RS_..." -> PUT /subaccounts/RS_... -> "Merchant not found".
+    Also insufficient fields in payload for some update validations.
+    FIX (this file): get_subaccount special-cases RS_ by listing + match on "subaccount_id" to return
+    the full item (with numeric "id"); then we set update_id = numeric and include carried fields
+    (business_*, account_*) from the fetched sub. See calls from _ensure/create/update in web_payment_links.py.
+    System behaviour with fix: edit link (bank or not) or pay will best-effort PUT the numeric id with
+    split_value=0.0025; no more merchant-not-found; dashboard sub record shows correct split (tx override
+    guarantees the 0.25% anyway).
     """
+    update_id = subaccount_id
+    sub = None
+    sid = str(subaccount_id or "")
+    if sid.startswith("RS_"):
+        sub = await get_subaccount(subaccount_id)
+        if sub and sub.get("id"):
+            update_id = sub["id"]
     payload = {
         "split_type": split_type,
         "split_value": split_value,
     }
+    if sub:
+        # carry over fields that update may require/validate to avoid merchant/validation errors
+        for k in ("business_name", "business_email", "business_mobile", "account_bank", "account_number", "country"):
+            if k in sub:
+                payload[k] = sub[k]
     async with _client() as client:
-        # The update endpoint accepts the subaccount identifier (RS_ or numeric)
         response = await client.put(
-            f"{FLW_BASE_URL}/subaccounts/{subaccount_id}",
+            f"{FLW_BASE_URL}/subaccounts/{update_id}",
             headers=_headers(),
             json=payload,
         )
         if response.is_error:
-            # Don't fail the payment if update fails; override at tx time is what matters
+            # Don't fail the payment if update fails; override at tx time is what matters.
+            # (See pay_link subaccounts override + finalize always-split path.)
             logger.warning("Failed to update subaccount %s split: %s", subaccount_id, response.text[:300])
             return {"status": "error", "message": response.text[:500]}
         response.raise_for_status()
