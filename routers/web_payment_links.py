@@ -412,7 +412,7 @@ async def create_link(
             PaymentLink.pool_id.is_(None)
         )
     )
-    if existing_link_result.scalar_first():
+    if existing_link_result.scalars().first():
         raise HTTPException(
             status_code=400,
             detail="You already have an active personal payment link. Please edit your existing link's bank details instead of creating a new one."
@@ -639,8 +639,8 @@ async def pay_link(
         },
         subaccounts=[{
             "id": link.flutterwave_subaccount_id,
-            "transaction_charge_type": "flat",
-            "transaction_charge": platform_charge,
+            "transaction_charge_type": "flat_subaccount",
+            "transaction_charge": recipient_amount,
         }],
     )
     checkout_url = checkout.get("data", {}).get("link")
