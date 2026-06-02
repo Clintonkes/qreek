@@ -784,6 +784,8 @@ async def pay_link(
                 "checkout_amount": existing.gross_amount or existing.amount,
                 "status": existing.status,
                 "payout_status": existing.payout_status,
+                "checkout_url": existing.provider_checkout_url,
+                "payment_url": existing.provider_checkout_url,
             }
         if existing.provider_checkout_url:
             await log_payment_event(db, event_type="checkout.idempotent.reused_url", reference=existing.reference, status=existing.status)
