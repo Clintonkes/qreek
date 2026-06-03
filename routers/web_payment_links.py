@@ -201,7 +201,7 @@ def _provider_settled_amount(data: dict, amount: float, provider_fee: float) -> 
     return round(max(float(amount or 0) - float(provider_fee or 0), 0), 2)
 
 
-async def _get_live_link(db: AsyncSession, code: str) -> PaymentLink:
+async def _get_live_link(db: AsyncSession, code: str, *, for_payment: bool = True) -> PaymentLink:
     result = await db.execute(select(PaymentLink).where(PaymentLink.code == code.upper()))
     link = result.scalar_one_or_none()
     if not link or not link.is_active:
@@ -209,11 +209,16 @@ async def _get_live_link(db: AsyncSession, code: str) -> PaymentLink:
         raise HTTPException(status_code=404, detail="Payment link not found.")
     if link.expires_at and link.expires_at < datetime.utcnow():
         await log_payment_event(db, event_type="link.resolve.expired", reference=code, status="failed")
-        # Auto-delete pool collection links on expire (records/tx stay via source or refs; personal links stay for history)
-        if link.pool_id:
-            await db.delete(link)
-            await db.commit()
-        raise HTTPException(status_code=410, detail="This payment link has expired.")
+        if for_payment:
+            # Block payments on expired links (pool or personal)
+            raise HTTPException(status_code=410, detail="This payment link has expired.")
+        else:
+            # For pool collection links, allow resolve even if expired so that "every other data concerning it"
+            # (history, totals, contributors, ledger) can ALWAYS be shown on the public checkout page / pool views.
+            # Per user spec: unable to accept payments, but data always showable. Do NOT delete the link row.
+            if not link.pool_id:
+                raise HTTPException(status_code=410, detail="This payment link has expired.")
+            # else: return the expired pool link so frontend can render the full data/ledger without payment form
     if link.max_uses and link.use_count >= link.max_uses:
         await log_payment_event(db, event_type="link.resolve.max_uses", reference=code, status="failed")
         raise HTTPException(status_code=410, detail="Maximum uses reached.")
@@ -826,8 +831,12 @@ async def list_links(claims: dict = Depends(decode_token), db: AsyncSession = De
     Lists all payment links created by the authenticated user.
     """
     phone  = claims["phone"]
+    # Return ALL links for the owner (no is_active filter). This ensures that even expired pool collection links
+    # can always have their full data (history, totals, etc.) shown to the creator/admin via the dashboard / settlements.
+    # Personal links that were manually deactivated are hard-deleted, so they won't appear.
+    # (File: routers/web_payment_links.py:828 (approx after edit), error was owner couldn't view expired pool data after expire date.)
     result = await db.execute(
-        select(PaymentLink).where(PaymentLink.created_by == phone, PaymentLink.is_active == True).order_by(desc(PaymentLink.created_at)).limit(50)
+        select(PaymentLink).where(PaymentLink.created_by == phone).order_by(desc(PaymentLink.created_at)).limit(50)
     )
     links = result.scalars().all()
     return {"links": [_link_dict(l, show_bank=True) for l in links]}
@@ -889,7 +898,9 @@ async def resolve_link(code: str, db: AsyncSession = Depends(get_db)):
     For pool collection links (link.pool_id), includes recent_contributions so the public
     checkout page can show live ledger (who paid, when, how much, running context) as requested.
     """
-    link = await _get_live_link(db, code)
+    # Use for_payment=False for resolve so that expired *pool* collection links still return full data
+    # (recent_contributions, totals, etc.) — payments are blocked but "can always show every other data concerning it".
+    link = await _get_live_link(db, code, for_payment=False)
     resp = {"link": _link_dict(link)}
     if link.pool_id:
         # Public view of recent payments into this pool link (for transparency on checkout page)
@@ -922,6 +933,7 @@ async def pay_link(
     Starts a public Flutterwave checkout for a specific Qreek payment link.
     The payer can complete with card, bank transfer, or any method enabled on Flutterwave.
     """
+    # for_payment=True (default) so expired pool links (and personal) cannot accept payments.
     link = await _get_live_link(db, code)
     await log_payment_event(db, event_type="link.pay.started", reference=code, status="started", payload={"has_idempotency": bool(body.idempotency_key)})
     await _ensure_link_subaccount(db, link)
