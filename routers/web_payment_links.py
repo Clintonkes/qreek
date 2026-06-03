@@ -43,7 +43,7 @@ from database.models import PaymentEvent, PaymentLink, Transaction, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, initialize_checkout, query_transaction_fee, update_subaccount, update_subaccount_split, verify_transaction
+from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_bank_account, update_subaccount, update_subaccount_split, verify_transaction
 from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
@@ -73,7 +73,7 @@ class CreateLinkIn(BaseModel):
     amount:       Optional[float] = None   # None = flexible
     bank_account: str
     bank_code:    str
-    max_uses:     Optional[int] = None
+    max_uses:     Optional[int] = None  # ignored; links have no max usage limit
     expires_days: Optional[int] = None
     provider:     Optional[str] = "flutterwave"
     pool_id:      Optional[str] = None  # if set, this is a pool collection link (0.15% fee, tied to pool for history)
@@ -114,7 +114,7 @@ class UpdateLinkIn(BaseModel):
     amount: Optional[float] = None  # None = flexible
     bank_account: Optional[str] = None
     bank_code: Optional[str] = None
-    max_uses: Optional[int] = None
+    max_uses: Optional[int] = None  # ignored; links have no max usage limit
     expires_days: Optional[int] = None
 
 
@@ -155,7 +155,6 @@ def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
         "id": l.id, "code": l.code, "title": l.title, "description": l.description,
         "amount": l.amount, "is_flexible": l.is_flexible,
         "bank_name": l.bank_name,
-        "max_uses": l.max_uses, "use_count": l.use_count,
         "total_collected": l.total_collected,
         "expires_at": l.expires_at.isoformat() if l.expires_at else None,
         "is_active": l.is_active,
@@ -219,10 +218,39 @@ async def _get_live_link(db: AsyncSession, code: str, *, for_payment: bool = Tru
             if not link.pool_id:
                 raise HTTPException(status_code=410, detail="This payment link has expired.")
             # else: return the expired pool link so frontend can render the full data/ledger without payment form
-    if link.max_uses and link.use_count >= link.max_uses:
-        await log_payment_event(db, event_type="link.resolve.max_uses", reference=code, status="failed")
-        raise HTTPException(status_code=410, detail="Maximum uses reached.")
     return link
+
+
+async def _verify_link_bank_account(db: AsyncSession, *, bank_code: str, bank_account: str, reference: str | None = None) -> dict:
+    try:
+        verified = await resolve_bank_account(account_bank=bank_code, account_number=bank_account)
+    except Exception as exc:
+        payload = {}
+        if isinstance(exc, FlutterwaveAPIError):
+            payload = exc.as_payload()
+        await log_payment_event(
+            db,
+            event_type="flutterwave.account.verify.failed",
+            reference=reference,
+            status="failed",
+            message=str(exc)[:300],
+            payload=payload,
+        )
+        raise HTTPException(status_code=400, detail="We could not verify this bank account. Check the bank and account number, then try again.")
+
+    data = verified.get("data") or {}
+    await log_payment_event(
+        db,
+        event_type="flutterwave.account.verify.completed",
+        reference=reference,
+        status="completed",
+        payload={
+            "bank_code": bank_code,
+            "account_number_last4": (bank_account or "")[-4:],
+            "account_name": data.get("account_name"),
+        },
+    )
+    return data
 
 
 async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
@@ -568,6 +596,10 @@ async def create_link(
     bank = resolve_bank(body.bank_code)
     if not bank:
         raise HTTPException(status_code=400, detail=f"Invalid bank code: {body.bank_code}")
+    await _verify_link_bank_account(db, bank_code=body.bank_code, bank_account=body.bank_account, reference=target_pool_id)
+
+    if target_pool_id and not body.expires_days:
+        raise HTTPException(status_code=400, detail="Due date is required for pool payment links.")
 
     expires_at = None
     if body.expires_days:
@@ -583,7 +615,6 @@ async def create_link(
         bank_account=body.bank_account,
         bank_code=body.bank_code,
         bank_name=bank["name"],
-        max_uses=body.max_uses,
         expires_at=expires_at,
         pool_id=target_pool_id,  # pool collection link if set; enables 0.15% fee + public history on checkout + auto-delete on expire
     )
@@ -720,6 +751,7 @@ async def update_link(
             bank = resolve_bank(new_bank_code)
             if not bank:
                 raise HTTPException(status_code=400, detail=f"Invalid bank code: {new_bank_code}")
+            await _verify_link_bank_account(db, bank_code=new_bank_code, bank_account=new_bank_account, reference=link.code)
             # Clear old sub so ensure/create will make a fresh one for the *new* bank account.
             # This is how you "change test bank" on the single link without new codes/links.
             link.flutterwave_subaccount_id = None
@@ -742,11 +774,11 @@ async def update_link(
         # This supports editing the amount/flexibility on the stable unique link.
         link.amount = body.amount
         link.is_flexible = body.amount is None
-    if body.max_uses is not None:
-        link.max_uses = body.max_uses
     if body.expires_days is not None:
         from datetime import timedelta
         link.expires_at = datetime.utcnow() + timedelta(days=body.expires_days) if body.expires_days > 0 else None
+    if link.pool_id and not link.expires_at:
+        raise HTTPException(status_code=400, detail="Due date is required for pool payment links.")
 
     await db.commit()
 

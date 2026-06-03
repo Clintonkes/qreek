@@ -146,6 +146,36 @@ async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
     return 0.0
 
 
+async def resolve_bank_account(*, account_bank: str, account_number: str) -> dict:
+    """
+    Verifies a Nigerian bank account with Flutterwave before Qreek stores it
+    as a payment-link settlement destination.
+    """
+    payload = {
+        "account_bank": account_bank,
+        "account_number": account_number,
+    }
+    async with _client() as client:
+        response = await client.post(f"{FLW_BASE_URL}/accounts/resolve", headers=_headers(), json=payload)
+        if response.is_error:
+            safe_payload = {**payload, "account_number": f"******{account_number[-4:]}"}
+            raise FlutterwaveAPIError(
+                f"Flutterwave account verification failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+                payload=safe_payload,
+            )
+        response.raise_for_status()
+        data = response.json()
+    resolved = data.get("data") or {}
+    if not resolved.get("account_number") or not resolved.get("account_name"):
+        raise FlutterwaveAPIError(
+            "Flutterwave account verification returned incomplete account details",
+            payload={"account_bank": account_bank, "account_number": f"******{account_number[-4:]}"},
+        )
+    return data
+
+
 async def create_collection_subaccount(
     *,
     account_bank: str,

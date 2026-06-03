@@ -12,6 +12,9 @@ Flow:
 """
 
 from contextlib import asynccontextmanager
+import json
+import logging
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,6 +22,12 @@ from starlette.requests import Request
 from database.session import init_db
 from routers import web_auth, web_rates, web_wallet, web_pools, web_alerts, web_ws, web_payroll, web_payment_links, web_flutterwave
 import os
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("qreek.api")
 
 
 @asynccontextmanager
@@ -32,6 +41,37 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Qreek Web API", version="1.0.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def railway_request_logger(request: Request, call_next):
+    started = time.perf_counter()
+    request_id = request.headers.get("x-request-id") or request.headers.get("railway-request-id")
+    log_base = {
+        "event": "http_request",
+        "request_id": request_id,
+        "method": request.method,
+        "path": request.url.path,
+        "query": str(request.url.query)[:500],
+        "client_ip": request.headers.get("x-forwarded-for", request.client.host if request.client else None),
+        "user_agent": request.headers.get("user-agent"),
+    }
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.exception(json.dumps({**log_base, "status_code": 500, "duration_ms": elapsed_ms}))
+        raise
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    log_line = json.dumps({**log_base, "status_code": response.status_code, "duration_ms": elapsed_ms})
+    if response.status_code >= 500:
+        logger.error(log_line)
+    elif response.status_code >= 400:
+        logger.warning(log_line)
+    else:
+        logger.info(log_line)
+    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,8 +93,12 @@ app.add_middleware(
 # so the browser doesn't block the response with "No 'Access-Control-Allow-Origin'".
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Log is already done by uvicorn for ASGI errors; here we just return clean JSON.
-    # In production you might want more selective handling (e.g. only for certain exc).
+    logger.exception(
+        "Unhandled API exception path=%s method=%s",
+        request.url.path,
+        request.method,
+        exc_info=exc,
+    )
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error. Please try again or contact support."},

@@ -33,7 +33,7 @@ FEE_POOL_NGN = 0.0015   # 0.15% for fiat pool sends
 
 class CreatePoolBody(BaseModel):
     name:      str
-    pool_type: str = "crypto"
+    pool_type: str = "fiat"
 
 
 class JoinPoolBody(BaseModel):
@@ -53,7 +53,7 @@ class PaymentRequestBody(BaseModel):
     title:    str
     amount:   float
     note:     Optional[str] = None
-    due_date: Optional[str] = None   # ISO date string
+    due_date: str   # ISO date string
 
 
 def _pool_dict(pool: Pool, role: str = "member") -> dict:
@@ -91,6 +91,24 @@ async def list_pools(claims: dict = Depends(decode_token), db: AsyncSession = De
         if p and p.is_active:
             pools.append(_pool_dict(p, m.role))
 
+    fiat_result = await db.execute(select(FiatPoolMember).where(FiatPoolMember.user_phone == phone))
+    fiat_memberships = fiat_result.scalars().all()
+    for m in fiat_memberships:
+        fpr = await db.execute(select(FiatPool).where(FiatPool.id == m.pool_id))
+        fp = fpr.scalar_one_or_none()
+        if fp and fp.is_active:
+            pools.append({
+                "id": fp.id,
+                "name": fp.name,
+                "invite_code": fp.invite_code,
+                "pool_type": "fiat",
+                "member_count": fp.member_count,
+                "total_volume": fp.total_volume,
+                "is_active": fp.is_active,
+                "created_at": fp.created_at.isoformat() if fp.created_at else None,
+                "role": m.role,
+            })
+
     return {"pools": pools}
 
 
@@ -107,6 +125,8 @@ async def create_pool(
     phone = claims["phone"]
     if body.pool_type not in ("crypto", "fiat"):
         raise HTTPException(status_code=400, detail="pool_type must be 'crypto' or 'fiat'")
+    if body.pool_type == "crypto":
+        raise HTTPException(status_code=400, detail="Crypto pool trading is coming soon.")
 
     if body.pool_type == "fiat":
         pool = FiatPool(name=body.name, creator_phone=phone)
@@ -116,12 +136,7 @@ async def create_pool(
         await db.commit()
         return {"id": pool.id, "name": pool.name, "invite_code": pool.invite_code, "pool_type": "fiat", "role": "admin"}
 
-    pool = Pool(name=body.name, creator_phone=phone, pool_type="crypto")
-    db.add(pool)
-    await db.flush()
-    db.add(PoolMember(pool_id=pool.id, user_phone=phone, role="admin"))
-    await db.commit()
-    return _pool_dict(pool, "admin")
+    raise HTTPException(status_code=400, detail="Crypto pool trading is coming soon.")
 
 
 @router.post("/join")
@@ -135,7 +150,8 @@ async def join_pool(
     Supports both crypto and fiat pools.
     """
     phone = claims["phone"]
-    code  = body.invite_code.strip().upper()
+    raw_code = body.invite_code.strip()
+    code = raw_code.rstrip("/").split("/")[-1].upper()
 
     pr   = await db.execute(select(Pool).where(Pool.invite_code == code))
     pool = pr.scalar_one_or_none()
@@ -153,7 +169,7 @@ async def join_pool(
         fpool.member_count = (fpool.member_count or 1) + 1
         db.add(FiatPoolMember(pool_id=fpool.id, user_phone=phone, role="member"))
         await db.commit()
-        return {"message": f"Joined fiat pool '{fpool.name}'", "pool_id": fpool.id, "pool_type": "fiat"}
+        return {"message": f"Joined fiat pool '{fpool.name}'", "id": fpool.id, "pool_id": fpool.id, "pool_type": "fiat", "role": "member"}
 
     if pool.creator_phone == phone:
         raise HTTPException(status_code=400, detail="You created this pool — you're already the admin.")
@@ -163,7 +179,7 @@ async def join_pool(
     pool.member_count = (pool.member_count or 1) + 1
     db.add(PoolMember(pool_id=pool.id, user_phone=phone, role="member"))
     await db.commit()
-    return {"message": f"Joined pool '{pool.name}'", **_pool_dict(pool, "member")}
+    return {"message": f"Joined pool '{pool.name}'", "pool_id": pool.id, **_pool_dict(pool, "member")}
 
 
 @router.get("/{pool_id}")
@@ -230,11 +246,8 @@ async def pool_send(
     claims:  dict = Depends(decode_token),
     db:      AsyncSession = Depends(get_db),
 ):
-    """
-    Processes a payout from a fiat pool.
-    Debits the sender's NGN balance and initiates an immediate payout to the recipient's bank.
-    Ensures the sender is a member of the pool and provides a correct PIN.
-    """
+    """Deprecated: pool payments now happen through verified pool payment links."""
+    raise HTTPException(status_code=410, detail="Direct pool send has been removed. Use pool payment links instead.")
     phone = claims["phone"]
 
     fpr   = await db.execute(select(FiatPool).where(FiatPool.id == pool_id))
@@ -396,11 +409,12 @@ async def create_request(
         raise HTTPException(status_code=403, detail="Only pool admins can create payment requests.")
 
     due = None
-    if body.due_date:
-        try:
-            due = datetime.fromisoformat(body.due_date)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid due_date format. Use ISO 8601.")
+    try:
+        due = datetime.fromisoformat(body.due_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid due_date format. Use ISO 8601.")
+    if due <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Due date must be in the future.")
 
     req = PaymentRequest(
         pool_id=pool_id, requested_by=phone,
@@ -487,7 +501,7 @@ async def report_dispute(
         action="pool_dispute_reported",
         entity_type="fiat_pool",
         entity_id=pool_id,
-        metadata={
+        event_metadata={
             "pool_id": pool_id,
             "transaction_id": body.transaction_id,
             "request_id": body.request_id,
@@ -545,7 +559,7 @@ async def transfer_admin(
     db.add(AuditLog(
         actor_phone=phone, action="pool_admin_transferred",
         entity_type="fiat_pool", entity_id=pool_id,
-        metadata={"from_phone": phone, "to_phone": new_phone, "pool_id": pool_id}
+        event_metadata={"from_phone": phone, "to_phone": new_phone, "pool_id": pool_id}
     ))
     await db.commit()
 
