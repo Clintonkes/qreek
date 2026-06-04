@@ -59,6 +59,7 @@ async def _ensure_ledger_columns(conn):
     statements before the API can insert the new ledger fields.
     """
     statements = [
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pool_id VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS gross_amount DOUBLE PRECISION",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS qreek_fee DOUBLE PRECISION DEFAULT 0.0",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_fee DOUBLE PRECISION DEFAULT 0.0",
@@ -76,6 +77,7 @@ async def _ensure_ledger_columns(conn):
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payout_reference VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payout_error TEXT",
         "CREATE INDEX IF NOT EXISTS ix_transactions_reference ON transactions (reference)",
+        "CREATE INDEX IF NOT EXISTS ix_transactions_pool_id ON transactions (pool_id)",
         "CREATE INDEX IF NOT EXISTS ix_transactions_tx_ref ON transactions (tx_ref)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_idempotency_key ON transactions (idempotency_key) WHERE idempotency_key IS NOT NULL",
         "CREATE TABLE IF NOT EXISTS payment_events (id VARCHAR PRIMARY KEY, provider VARCHAR DEFAULT 'flutterwave', reference VARCHAR, transaction_id VARCHAR, event_type VARCHAR NOT NULL, status VARCHAR, message TEXT, payload JSON, created_at TIMESTAMP WITHOUT TIME ZONE)",
