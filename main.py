@@ -29,6 +29,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("qreek.api")
 
+ALLOWED_ORIGINS = [
+    "https://qreekfinance.org",
+    "https://www.qreekfinance.org",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
+
+def _cors_headers(origin: str | None) -> dict[str, str]:
+    if not origin or origin not in ALLOWED_ORIGINS:
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
+    }
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,7 +78,11 @@ async def railway_request_logger(request: Request, call_next):
     except Exception:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         logger.exception(json.dumps({**log_base, "status_code": 500, "duration_ms": elapsed_ms}))
-        raise
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error. Please try again or contact support."},
+            headers=_cors_headers(request.headers.get("origin")),
+        )
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     log_line = json.dumps({**log_base, "status_code": response.status_code, "duration_ms": elapsed_ms})
@@ -75,13 +96,7 @@ async def railway_request_logger(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://qreekfinance.org",
-        "https://www.qreekfinance.org",
-        "http://localhost:5173",
-        "http://localhost:3000",
-        os.getenv("FRONTEND_URL", ""),
-    ],
+    allow_origins=ALLOWED_ORIGINS + ([os.getenv("FRONTEND_URL", "")] if os.getenv("FRONTEND_URL", "") else []),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -102,6 +117,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error. Please try again or contact support."},
+        headers=_cors_headers(request.headers.get("origin")),
     )
 
 app.include_router(web_auth.router)

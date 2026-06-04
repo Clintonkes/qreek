@@ -98,6 +98,11 @@ class ConfirmFlutterwaveIn(BaseModel):
     status:         Optional[str] = None
 
 
+class VerifyBankIn(BaseModel):
+    bank_code:    str
+    bank_account: str
+
+
 class UpdateLinkIn(BaseModel):
     """
     Partial update for a payment link. Per requirements, links (for non-pool payments)
@@ -251,6 +256,29 @@ async def _verify_link_bank_account(db: AsyncSession, *, bank_code: str, bank_ac
         },
     )
     return data
+
+
+@router.post("/verify-bank")
+async def verify_bank_account(
+    body: VerifyBankIn,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verifies a Nigerian bank account before the user submits a payment link form.
+    This gives the UI a clean preflight check and avoids submitting bad bank details.
+    """
+    data = await _verify_link_bank_account(
+        db,
+        bank_code=body.bank_code,
+        bank_account=body.bank_account,
+        reference=claims.get("phone"),
+    )
+    return {
+        "bank_code": body.bank_code,
+        "bank_account": body.bank_account,
+        "account_name": data.get("account_name"),
+    }
 
 
 async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
