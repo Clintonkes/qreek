@@ -39,7 +39,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from database.session import get_db
-from database.models import PaymentEvent, PaymentLink, Transaction, UserSecurity
+from database.models import FiatPool, PaymentEvent, PaymentLink, Transaction, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
