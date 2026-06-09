@@ -144,6 +144,27 @@ def _payment_dict(tx: Transaction) -> dict:
     }
 
 
+def _public_pool_payment_dict(tx: Transaction) -> dict:
+    """
+    Public-safe payment summary for pool ledger views.
+    Exposes the payer name and payment details, while masking phone numbers.
+    """
+    payer_phone = tx.payer_phone or ""
+    masked_phone = None
+    if payer_phone:
+        masked_phone = f"***{payer_phone[-4:]}" if len(payer_phone) >= 4 else "***"
+    return {
+        "reference": tx.reference,
+        "created_at": tx.created_at.isoformat() if tx.created_at else None,
+        "amount": tx.net_amount or tx.ngn_amount or tx.amount,
+        "payer_name": tx.payer_name or "Anonymous",
+        "payer_phone": masked_phone,
+        "payment_description": tx.payment_description,
+        "status": tx.status,
+        "payout_status": tx.payout_status,
+    }
+
+
 def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
     """
     Helper function to convert a PaymentLink model instance to a dictionary.
@@ -939,6 +960,52 @@ async def resolve_link(code: str, db: AsyncSession = Depends(get_db)):
         resp["recent_contributions"] = recent
         resp["pool_total_via_link"] = link.total_collected or 0
     return resp
+
+
+@router.get("/public/{code}/contributions")
+async def public_pool_contributions(
+    code: str,
+    db: AsyncSession = Depends(get_db),
+    page: int = 1,
+    per_page: int = 25,
+):
+    """
+    Public, unauthenticated pool ledger endpoint.
+    Returns paginated contribution history for pool links so the public payment
+    page can show all payments without requiring login.
+    """
+    page = max(int(page or 1), 1)
+    per_page = min(max(int(per_page or 25), 1), 100)
+
+    link = await _get_live_link(db, code, for_payment=False)
+    if not link.pool_id:
+        raise HTTPException(status_code=400, detail="This payment link does not have a public pool ledger.")
+
+    count_result = await db.execute(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.pool_id == link.id,
+            Transaction.tx_type == "payment_link",
+        )
+    )
+    total = count_result.scalar_one() or 0
+
+    txs_res = await db.execute(
+        select(Transaction).where(
+            Transaction.pool_id == link.id,
+            Transaction.tx_type == "payment_link",
+        ).order_by(desc(Transaction.created_at)).offset((page - 1) * per_page).limit(per_page)
+    )
+    payments = [_public_pool_payment_dict(tx) for tx in txs_res.scalars().all()]
+
+    return {
+        "payments": payments,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": (total + per_page - 1) // per_page if per_page else 1,
+        "total_collected": link.total_collected or 0,
+        "link": _link_dict(link),
+    }
 
 
 @router.post("/pay/{code}")
