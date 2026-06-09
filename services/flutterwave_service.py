@@ -146,36 +146,6 @@ async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
     return 0.0
 
 
-async def resolve_bank_account(*, account_bank: str, account_number: str) -> dict:
-    """
-    Verifies a Nigerian bank account with Flutterwave before Qreek stores it
-    as a payment-link settlement destination.
-    """
-    payload = {
-        "account_bank": account_bank,
-        "account_number": account_number,
-    }
-    async with _client() as client:
-        response = await client.post(f"{FLW_BASE_URL}/accounts/resolve", headers=_headers(), json=payload)
-        if response.is_error:
-            safe_payload = {**payload, "account_number": f"******{account_number[-4:]}"}
-            raise FlutterwaveAPIError(
-                f"Flutterwave account verification failed ({response.status_code})",
-                status_code=response.status_code,
-                response_text=response.text[:1000],
-                payload=safe_payload,
-            )
-        response.raise_for_status()
-        data = response.json()
-    resolved = data.get("data") or {}
-    if not resolved.get("account_number") or not resolved.get("account_name"):
-        raise FlutterwaveAPIError(
-            "Flutterwave account verification returned incomplete account details",
-            payload={"account_bank": account_bank, "account_number": f"******{account_number[-4:]}"},
-        )
-    return data
-
-
 async def create_collection_subaccount(
     *,
     account_bank: str,
@@ -209,6 +179,20 @@ async def create_collection_subaccount(
             json_body=payload,
         )
         if response.is_error:
+            existing = await find_collection_subaccount(account_bank, account_number)
+            if existing:
+                logger.info(
+                    "Reusing existing Flutterwave subaccount for bank %s account ****%s",
+                    account_bank,
+                    account_number[-4:],
+                )
+                return {
+                    "data": existing,
+                    "meta": {
+                        "reused": True,
+                        "reason": "existing_subaccount",
+                    },
+                }
             safe_payload = {**payload, "account_number": f"******{account_number[-4:]}"}
             # Raise with full context — the caller is responsible for structured
             # logging so we avoid double-logging the same failure event.
@@ -220,6 +204,27 @@ async def create_collection_subaccount(
             )
         response.raise_for_status()
         return response.json()
+
+
+async def find_collection_subaccount(account_bank: str, account_number: str) -> dict | None:
+    """
+    Finds an existing collection subaccount for the provided bank account.
+    This is used to recover links where Flutterwave already has a subaccount
+    for the bank/account pair, so we can reuse it instead of failing on create.
+    """
+    if not account_bank or not account_number:
+        return None
+
+    async with _client() as client:
+        response = await client.get(f"{FLW_BASE_URL}/subaccounts", headers=_headers())
+        if response.is_error:
+            logger.warning("List subaccounts failed while searching for an existing collection subaccount: %s", response.text[:200])
+            return None
+
+        for item in (response.json().get("data") or []):
+            if str(item.get("account_bank")) == str(account_bank) and str(item.get("account_number")) == str(account_number):
+                return item
+    return None
 
 
 async def get_subaccount(subaccount_id: str) -> dict:
@@ -298,6 +303,32 @@ async def update_subaccount(
             logger.warning("Failed to update subaccount %s: %s", subaccount_id, response.text[:300])
             return {"status": "error", "message": response.text[:500]}
         response.raise_for_status()
+        return response.json()
+
+
+async def resolve_account(account_number: str, bank_code: str) -> dict:
+    """
+    Uses Flutterwave's accounts/resolve to verify bank account number + code before
+    saving for a pool payment link. Returns the resolved account details (incl. account_name)
+    or raises FlutterwaveAPIError on failure. This ensures the bank details for pool
+    collection links are verified before being saved into our system (per user request).
+    """
+    if not account_number or not bank_code:
+        raise ValueError("account_number and bank_code required")
+    params = {"account_number": account_number, "bank_code": bank_code}
+    async with _client() as client:
+        response = await client.get(
+            f"{FLW_BASE_URL}/accounts/resolve",
+            headers=_headers(),
+            params=params,
+        )
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"Account verification failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+                payload={"account_number": account_number[-4:], "bank_code": bank_code},
+            )
         return response.json()
 
 

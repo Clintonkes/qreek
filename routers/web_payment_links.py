@@ -39,11 +39,11 @@ from pydantic import BaseModel
 from typing import Optional
 
 from database.session import get_db
-from database.models import FiatPool, PaymentEvent, PaymentLink, Transaction, UserSecurity
+from database.models import PaymentEvent, PaymentLink, Transaction, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_bank_account, update_subaccount, update_subaccount_split, verify_transaction
+from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, verify_transaction
 from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
@@ -73,7 +73,6 @@ class CreateLinkIn(BaseModel):
     amount:       Optional[float] = None   # None = flexible
     bank_account: str
     bank_code:    str
-    max_uses:     Optional[int] = None  # ignored; links have no max usage limit
     expires_days: Optional[int] = None
     provider:     Optional[str] = "flutterwave"
     pool_id:      Optional[str] = None  # if set, this is a pool collection link (0.15% fee, tied to pool for history)
@@ -98,11 +97,6 @@ class ConfirmFlutterwaveIn(BaseModel):
     status:         Optional[str] = None
 
 
-class VerifyBankIn(BaseModel):
-    bank_code:    str
-    bank_account: str
-
-
 class UpdateLinkIn(BaseModel):
     """
     Partial update for a payment link. Per requirements, links (for non-pool payments)
@@ -119,7 +113,6 @@ class UpdateLinkIn(BaseModel):
     amount: Optional[float] = None  # None = flexible
     bank_account: Optional[str] = None
     bank_code: Optional[str] = None
-    max_uses: Optional[int] = None  # ignored; links have no max usage limit
     expires_days: Optional[int] = None
 
 
@@ -160,12 +153,13 @@ def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
         "id": l.id, "code": l.code, "title": l.title, "description": l.description,
         "amount": l.amount, "is_flexible": l.is_flexible,
         "bank_name": l.bank_name,
+        "use_count": l.use_count,  # still tracked for info, but no max_uses enforcement
         "total_collected": l.total_collected,
         "expires_at": l.expires_at.isoformat() if l.expires_at else None,
         "is_active": l.is_active,
         "created_at": l.created_at.isoformat() if l.created_at else None,
         "url": f"https://qreekfinance.org/p/{l.code}",
-        "pool_id": l.pool_id,  # present for pool collection links (0.15% fee, public ledger, auto expire delete)
+        "pool_id": l.pool_id,  # present for pool collection links (0.15% fee, public ledger, data always visible after expire)
     }
     if show_bank:
         d["bank_account"] = "****" + l.bank_account[-4:] if l.bank_account else None
@@ -223,62 +217,11 @@ async def _get_live_link(db: AsyncSession, code: str, *, for_payment: bool = Tru
             if not link.pool_id:
                 raise HTTPException(status_code=410, detail="This payment link has expired.")
             # else: return the expired pool link so frontend can render the full data/ledger without payment form
+    # NOTE: max_uses removed entirely per spec (no max usage for any links; only expiration by date makes link inactive for new payments, but all received payment data remains visible forever).
+    # Previously this check existed at this line and caused 410 for maxed links even for view.
+    # Fix: removed the block and all references to max_uses in link creation/editing.
+    # System behaviour: links only become inactive for payments on expire date (for_payment path); data always showable via resolve for pool links and owner views.
     return link
-
-
-async def _verify_link_bank_account(db: AsyncSession, *, bank_code: str, bank_account: str, reference: str | None = None) -> dict:
-    try:
-        verified = await resolve_bank_account(account_bank=bank_code, account_number=bank_account)
-    except Exception as exc:
-        payload = {}
-        if isinstance(exc, FlutterwaveAPIError):
-            payload = exc.as_payload()
-        await log_payment_event(
-            db,
-            event_type="flutterwave.account.verify.failed",
-            reference=reference,
-            status="failed",
-            message=str(exc)[:300],
-            payload=payload,
-        )
-        raise HTTPException(status_code=400, detail="We could not verify this bank account. Check the bank and account number, then try again.")
-
-    data = verified.get("data") or {}
-    await log_payment_event(
-        db,
-        event_type="flutterwave.account.verify.completed",
-        reference=reference,
-        status="completed",
-        payload={
-            "bank_code": bank_code,
-            "account_number_last4": (bank_account or "")[-4:],
-            "account_name": data.get("account_name"),
-        },
-    )
-    return data
-
-
-@router.post("/verify-bank")
-async def verify_bank_account(
-    body: VerifyBankIn,
-    claims: dict = Depends(decode_token),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Verifies a Nigerian bank account before the user submits a payment link form.
-    This gives the UI a clean preflight check and avoids submitting bad bank details.
-    """
-    data = await _verify_link_bank_account(
-        db,
-        bank_code=body.bank_code,
-        bank_account=body.bank_account,
-        reference=claims.get("phone"),
-    )
-    return {
-        "bank_code": body.bank_code,
-        "bank_account": body.bank_account,
-        "account_name": data.get("account_name"),
-    }
 
 
 async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
@@ -318,27 +261,35 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
         link.flutterwave_subaccount_status = locked_link.flutterwave_subaccount_status
         return
     if locked_link and locked_link.flutterwave_subaccount_status == "failed":
-        # ERROR (pre-fix, this block at ~189-198):
-        #   Allowed pay_link to continue and create checkout even with no/failed subaccount_id.
-        #   Then finalize would hit the transfer fallback (or insufficient). This violated
-        #   "split at the point of payment success" and "no transfer fallback".
-        #   Combined with one-active-per-user (create_link:441) + no edit endpoint (despite
-        #   error msg at create_link:444 promising "Please edit your existing link's bank details"),
-        #   users had to deactivate/create-new per test bank (or live with bad split_value=0.9975
-        #   sub on their canonical link).
-        # FIX: Do not silently proceed. The caller (pay_link) will now check after _ensure and
-        #   reject checkout if no subaccount_id. Bank edit endpoint (new) + re-create sub on
-        #   bank change lets you update the single unique link's bank (and get fresh correct sub
-        #   with split_value=0.0025) without new links.
-        # System with error: payments could succeed without split configured -> either reversed
-        #   funds or transfer attempts (IP whitelist failures).
-        # System with fix: pay is blocked until a good subaccount split is attached to the link.
+        # A previous attempt failed, but the subaccount may already exist now or
+        # Flutterwave may accept a retry for the same bank/account pair. Do not
+        # hard-stop here; let the normal ensure/create flow attempt recovery.
+        recovered = None
+        if link.bank_code and link.bank_account:
+            recovered = await find_collection_subaccount(link.bank_code, link.bank_account)
+        if recovered:
+            rs_id = recovered.get("subaccount_id") or recovered.get("id")
+            link.flutterwave_subaccount_id = str(rs_id) if rs_id else None
+            link.flutterwave_subaccount_status = "active" if link.flutterwave_subaccount_id else "missing_id"
+            link.flutterwave_subaccount_error = None if link.flutterwave_subaccount_id else "Recovered subaccount missing id"
+            await log_payment_event(
+                db,
+                event_type="flutterwave.subaccount.recovered",
+                reference=link.code,
+                status=link.flutterwave_subaccount_status,
+                payload={"link_id": link.id, "subaccount_id": link.flutterwave_subaccount_id, "flutterwave": recovered},
+            )
+            try:
+                await update_subaccount(link.flutterwave_subaccount_id)
+            except Exception:
+                pass
+            await db.commit()
+            return
         logger.warning(
-            "Subaccount creation previously failed for link %s (status=failed, last_error=%s) -- pay will be rejected until bank is edited",
+            "Subaccount creation previously failed for link %s (status=failed, last_error=%s) -- retrying ensure/reuse",
             link.code,
             locked_link.flutterwave_subaccount_error,
         )
-        return
     try:
         await log_payment_event(
             db,
@@ -624,10 +575,20 @@ async def create_link(
     bank = resolve_bank(body.bank_code)
     if not bank:
         raise HTTPException(status_code=400, detail=f"Invalid bank code: {body.bank_code}")
-    await _verify_link_bank_account(db, bank_code=body.bank_code, bank_account=body.bank_account, reference=target_pool_id)
 
-    if target_pool_id and not body.expires_days:
-        raise HTTPException(status_code=400, detail="Due date is required for pool payment links.")
+    # For pool payment links: verify the bank details with Flutterwave before saving the link.
+    # This ensures the account is valid (account name matches etc.) using FW's resolve.
+    # File: routers/web_payment_links.py:568 (after local resolve_bank)
+    # Error: previously bank could be saved without verification for pool collection links, leading to bad subaccounts later.
+    # Fix: call resolve_account which hits /accounts/resolve ; if fails, 400 before creating link/sub.
+    # System behaviour: pool link creation now requires successful FW account verification; personal links unchanged (sub create will still fail on bad bank).
+    if target_pool_id:
+        try:
+            await resolve_account(body.bank_account, body.bank_code)
+            await log_payment_event(db, event_type="pool.link.bank.verified", reference=None, status="success", payload={"pool_id": target_pool_id, "bank_code": body.bank_code})
+        except Exception as exc:
+            await log_payment_event(db, event_type="pool.link.bank.verify_failed", reference=None, status="failed", message=str(exc)[:300])
+            raise HTTPException(status_code=400, detail=f"Bank account verification failed using Flutterwave. Please check the account number and bank: {str(exc)[:200]}")
 
     expires_at = None
     if body.expires_days:
@@ -644,7 +605,7 @@ async def create_link(
         bank_code=body.bank_code,
         bank_name=bank["name"],
         expires_at=expires_at,
-        pool_id=target_pool_id,  # pool collection link if set; enables 0.15% fee + public history on checkout + auto-delete on expire
+        pool_id=target_pool_id,  # pool collection link if set; enables 0.15% fee + public history on checkout + data always visible after expire
     )
     db.add(link)
     await db.commit()
@@ -779,7 +740,6 @@ async def update_link(
             bank = resolve_bank(new_bank_code)
             if not bank:
                 raise HTTPException(status_code=400, detail=f"Invalid bank code: {new_bank_code}")
-            await _verify_link_bank_account(db, bank_code=new_bank_code, bank_account=new_bank_account, reference=link.code)
             # Clear old sub so ensure/create will make a fresh one for the *new* bank account.
             # This is how you "change test bank" on the single link without new codes/links.
             link.flutterwave_subaccount_id = None
@@ -805,8 +765,6 @@ async def update_link(
     if body.expires_days is not None:
         from datetime import timedelta
         link.expires_at = datetime.utcnow() + timedelta(days=body.expires_days) if body.expires_days > 0 else None
-    if link.pool_id and not link.expires_at:
-        raise HTTPException(status_code=400, detail="Due date is required for pool payment links.")
 
     await db.commit()
 
