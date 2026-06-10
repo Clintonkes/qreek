@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 from database.session import init_db
-from routers import web_auth, web_rates, web_wallet, web_pools, web_alerts, web_ws, web_payroll, web_payment_links, web_flutterwave
+from routers import web_auth, web_rates, web_wallet, web_pools, web_family, web_alerts, web_ws, web_payroll, web_payment_links, web_flutterwave
 import os
 
 logging.basicConfig(
@@ -124,6 +124,7 @@ app.include_router(web_auth.router)
 app.include_router(web_rates.router)
 app.include_router(web_wallet.router)
 app.include_router(web_pools.router)
+app.include_router(web_family.router)
 app.include_router(web_alerts.router)
 app.include_router(web_payroll.router)
 app.include_router(web_payment_links.router)

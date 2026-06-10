@@ -39,7 +39,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from database.session import get_db
-from database.models import PaymentEvent, PaymentLink, Transaction, UserSecurity
+from database.models import FamilyGroup, FamilyMember, PaymentEvent, PaymentLink, Transaction, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
@@ -49,7 +49,7 @@ from services.sms_service import send_link_payment_received_sms, send_payment_re
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
 FEE_PCT = 0.0025  # 0.25% default for personal (non-pool) payment links
-POOL_FEE_PCT = 0.0015  # 0.15% for pool collection links (as specified for pooling pattern)
+GROUP_FEE_PCT = 0.0015  # 0.15% for group collection links (pools and family links)
 
 
 async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float = FEE_PCT) -> tuple[float, float, float]:
@@ -76,6 +76,7 @@ class CreateLinkIn(BaseModel):
     expires_days: Optional[int] = None
     provider:     Optional[str] = "flutterwave"
     pool_id:      Optional[str] = None  # if set, this is a pool collection link (0.15% fee, tied to pool for history)
+    family_id:    Optional[str] = None  # if set, this is a family collection link (0.15% fee, tied to family history)
 
 
 class PayLinkIn(BaseModel):
@@ -146,19 +147,15 @@ def _payment_dict(tx: Transaction) -> dict:
 
 def _public_pool_payment_dict(tx: Transaction) -> dict:
     """
-    Public-safe payment summary for pool ledger views.
-    Exposes the payer name and payment details, while masking phone numbers.
+    Public payment summary for pool/family ledger views.
+    The payer details are shown exactly as recorded in the database.
     """
-    payer_phone = tx.payer_phone or ""
-    masked_phone = None
-    if payer_phone:
-        masked_phone = f"***{payer_phone[-4:]}" if len(payer_phone) >= 4 else "***"
     return {
         "reference": tx.reference,
         "created_at": tx.created_at.isoformat() if tx.created_at else None,
         "amount": tx.net_amount or tx.ngn_amount or tx.amount,
-        "payer_name": tx.payer_name or "Anonymous",
-        "payer_phone": masked_phone,
+        "payer_name": tx.payer_name or "",
+        "payer_phone": tx.payer_phone or "",
         "payment_description": tx.payment_description,
         "status": tx.status,
         "payout_status": tx.payout_status,
@@ -181,6 +178,7 @@ def _link_dict(l: PaymentLink, show_bank: bool = False) -> dict:
         "created_at": l.created_at.isoformat() if l.created_at else None,
         "url": f"https://qreekfinance.org/p/{l.code}",
         "pool_id": l.pool_id,  # present for pool collection links (0.15% fee, public ledger, data always visible after expire)
+        "family_id": l.family_id,
     }
     if show_bank:
         d["bank_account"] = "****" + l.bank_account[-4:] if l.bank_account else None
@@ -235,7 +233,7 @@ async def _get_live_link(db: AsyncSession, code: str, *, for_payment: bool = Tru
             # For pool collection links, allow resolve even if expired so that "every other data concerning it"
             # (history, totals, contributors, ledger) can ALWAYS be shown on the public checkout page / pool views.
             # Per user spec: unable to accept payments, but data always showable. Do NOT delete the link row.
-            if not link.pool_id:
+            if not link.pool_id and not link.family_id:
                 raise HTTPException(status_code=410, detail="This payment link has expired.")
             # else: return the expired pool link so frontend can render the full data/ledger without payment form
     # NOTE: max_uses removed entirely per spec (no max usage for any links; only expiration by date makes link inactive for new payments, but all received payment data remains visible forever).
@@ -323,7 +321,7 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
             select(UserSecurity).where(UserSecurity.phone == link.created_by)
         )
         security = security_result.scalar_one_or_none()
-        sub_split_value = POOL_FEE_PCT if link.pool_id else 0.0025
+        sub_split_value = GROUP_FEE_PCT if (link.pool_id or link.family_id) else 0.0025
         subaccount = await create_collection_subaccount(
             account_bank=link.bank_code,
             account_number=link.bank_account,
@@ -482,6 +480,13 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
         if was_unsettled:
             link.use_count = (link.use_count or 0) + 1
             link.total_collected = (link.total_collected or 0) + (tx.net_amount or tx.ngn_amount or 0)
+            if tx.family_id:
+                family_result = await db.execute(select(FamilyGroup).where(FamilyGroup.id == tx.family_id).with_for_update())
+                family = family_result.scalar_one_or_none()
+                if family:
+                    added = round(float(tx.net_amount or tx.ngn_amount or tx.amount or 0), 2)
+                    family.balance_ngn = round((family.balance_ngn or 0) + added, 2)
+                    family.total_contributed = round((family.total_contributed or 0) + added, 2)
         await log_payment_event(
             db,
             event_type="flutterwave.split.completed",
@@ -576,19 +581,30 @@ async def create_link(
             PaymentLink.pool_id.is_(None)
         )
     )
-    if existing_link_result.scalars().first() and not body.pool_id:
+    if existing_link_result.scalars().first() and not body.pool_id and not body.family_id:
         raise HTTPException(
             status_code=400,
             detail="You already have an active personal payment link. Please edit your existing link's bank details instead of creating a new one."
         )
 
-    # For pool collection links: validate creator is admin of the FiatPool
+    # For pool and family collection links: validate the destination group owner/admin.
     target_pool_id = body.pool_id
+    target_family_id = body.family_id
+    if target_pool_id and target_family_id:
+        raise HTTPException(status_code=400, detail="Choose either a pool or family link, not both.")
     if target_pool_id:
         fpr = await db.execute(select(FiatPool).where(FiatPool.id == target_pool_id, FiatPool.creator_phone == phone))
         if not fpr.scalar_one_or_none():
-            # allow if member? but for creating collection link, require admin/creator for the destination bank
             raise HTTPException(status_code=403, detail="Only the pool creator/admin can create collection links for a pool.")
+    if target_family_id:
+        family_result = await db.execute(select(FamilyGroup).where(FamilyGroup.id == target_family_id))
+        family = family_result.scalar_one_or_none()
+        if not family:
+            raise HTTPException(status_code=404, detail="Family not found.")
+        member_result = await db.execute(select(FamilyMember).where(FamilyMember.family_id == target_family_id, FamilyMember.user_phone == phone))
+        member = member_result.scalar_one_or_none()
+        if not member or member.role != "admin":
+            raise HTTPException(status_code=403, detail="Only the family admin can create collection links for a family.")
 
     if not body.description.strip():
         raise HTTPException(status_code=400, detail="Description is required.")
@@ -603,10 +619,10 @@ async def create_link(
     # Error: previously bank could be saved without verification for pool collection links, leading to bad subaccounts later.
     # Fix: call resolve_account which hits /accounts/resolve ; if fails, 400 before creating link/sub.
     # System behaviour: pool link creation now requires successful FW account verification; personal links unchanged (sub create will still fail on bad bank).
-    if target_pool_id:
+    if target_pool_id or target_family_id:
         try:
             await resolve_account(body.bank_account, body.bank_code)
-            await log_payment_event(db, event_type="pool.link.bank.verified", reference=None, status="success", payload={"pool_id": target_pool_id, "bank_code": body.bank_code})
+            await log_payment_event(db, event_type="pool.link.bank.verified", reference=None, status="success", payload={"pool_id": target_pool_id, "family_id": target_family_id, "bank_code": body.bank_code})
         except Exception as exc:
             await log_payment_event(db, event_type="pool.link.bank.verify_failed", reference=None, status="failed", message=str(exc)[:300])
             raise HTTPException(status_code=400, detail=f"Bank account verification failed using Flutterwave. Please check the account number and bank: {str(exc)[:200]}")
@@ -627,6 +643,7 @@ async def create_link(
         bank_name=bank["name"],
         expires_at=expires_at,
         pool_id=target_pool_id,  # pool collection link if set; enables 0.15% fee + public history on checkout + data always visible after expire
+        family_id=target_family_id,
     )
     db.add(link)
     await db.commit()
@@ -637,13 +654,13 @@ async def create_link(
     )
     creator_security = creator_security_result.scalar_one_or_none()
 
-    sub_split_value = POOL_FEE_PCT if target_pool_id else 0.0025
+    sub_split_value = GROUP_FEE_PCT if (target_pool_id or target_family_id) else 0.0025
     try:
         await log_payment_event(
             db,
             event_type="flutterwave.subaccount.create.started",
             status="started",
-            payload={"link_id": link.id, "bank_code": body.bank_code, "account_number_last4": body.bank_account[-4:], "is_pool": bool(target_pool_id)},
+            payload={"link_id": link.id, "bank_code": body.bank_code, "account_number_last4": body.bank_account[-4:], "is_pool": bool(target_pool_id), "is_family": bool(target_family_id)},
         )
         subaccount = await create_collection_subaccount(
             account_bank=body.bank_code,
@@ -793,7 +810,7 @@ async def update_link(
     # This makes "I edited the name of the link" actually appear on the Flutterwave subaccount dashboard.
     if link.flutterwave_subaccount_id:
         try:
-            sv = POOL_FEE_PCT if link.pool_id else 0.0025
+            sv = GROUP_FEE_PCT if (link.pool_id or link.family_id) else 0.0025
             await update_subaccount(
                 link.flutterwave_subaccount_id,
                 business_name=link.title,
@@ -817,7 +834,7 @@ async def update_link(
                 status="started",
                 payload={"link_id": link.id, "bank_code": new_bank_code, "account_number_last4": (new_bank_account or "")[-4:]},
             )
-            sub_split_value = POOL_FEE_PCT if link.pool_id else 0.0025
+            sub_split_value = GROUP_FEE_PCT if (link.pool_id or link.family_id) else 0.0025
             subaccount = await create_collection_subaccount(
                 account_bank=new_bank_code,
                 account_number=new_bank_account,
@@ -941,8 +958,8 @@ async def resolve_link(code: str, db: AsyncSession = Depends(get_db)):
     # (recent_contributions, totals, etc.) — payments are blocked but "can always show every other data concerning it".
     link = await _get_live_link(db, code, for_payment=False)
     resp = {"link": _link_dict(link)}
-    if link.pool_id:
-        # Public view of recent payments into this pool link (for transparency on checkout page)
+    if link.pool_id or link.family_id:
+        # Public view of recent payments into this link (for transparency on checkout page)
         txs_res = await db.execute(
             select(Transaction).where(
                 Transaction.pool_id == link.id,
@@ -953,9 +970,13 @@ async def resolve_link(code: str, db: AsyncSession = Depends(get_db)):
         for t in txs_res.scalars().all():
             recent.append({
                 "date": t.created_at.isoformat() if t.created_at else None,
-                "payer": (t.payer_name or (t.payer_phone or "Anonymous")[:8] + "..."),
+                "payer_name": t.payer_name or "",
+                "payer_phone": t.payer_phone or "",
                 "amount": t.net_amount or t.ngn_amount or t.amount,
                 "reference": t.reference,
+                "payment_description": t.payment_description,
+                "status": t.status,
+                "payout_status": t.payout_status,
             })
         resp["recent_contributions"] = recent
         resp["pool_total_via_link"] = link.total_collected or 0
@@ -978,7 +999,7 @@ async def public_pool_contributions(
     per_page = min(max(int(per_page or 25), 1), 100)
 
     link = await _get_live_link(db, code, for_payment=False)
-    if not link.pool_id:
+    if not link.pool_id and not link.family_id:
         raise HTTPException(status_code=400, detail="This payment link does not have a public pool ledger.")
 
     count_result = await db.execute(
@@ -1044,7 +1065,7 @@ async def pay_link(
         raise HTTPException(status_code=400, detail="Payment description is required.")
 
     # tx override + fee: use 0.15% for pool collection links (link.pool_id set), 0.25% for personal
-    link_fee_pct = POOL_FEE_PCT if link.pool_id else FEE_PCT
+    link_fee_pct = GROUP_FEE_PCT if (link.pool_id or link.family_id) else FEE_PCT
     checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(recipient_amount, fee_pct=link_fee_pct)
     platform_charge = round(checkout_amount - recipient_amount, 2)
     idempotency_key = body.idempotency_key or f"{code.upper()}:{body.phone or body.payer_phone or 'anon'}:{recipient_amount}:{payment_description}"
@@ -1102,7 +1123,9 @@ async def pay_link(
     else:
         ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
 
-    payer_name = (body.name or body.payer_name or "Qreek payer").strip()
+    payer_name = (body.name or body.payer_name or "").strip()
+    if not payer_name:
+        raise HTTPException(status_code=400, detail="Payer name is required.")
     payer_phone = body.phone or body.payer_phone
     if not existing:
         tx = Transaction(
@@ -1117,7 +1140,7 @@ async def pay_link(
             provider_settled_amount=round(checkout_amount - provider_fee_estimate, 2),
             net_amount=recipient_amount,
             fee=fee,
-            fee_pct=FEE_PCT,
+            fee_pct=link_fee_pct,
             status="pending",
             provider="flutterwave",
             reference=ref,
@@ -1128,6 +1151,7 @@ async def pay_link(
             payer_phone=payer_phone,
             pool_id=link.id,  # PaymentLink.id for per-link settlements / finalize lookup
             source_pool_id=link.pool_id,  # the actual pool id, for pool history even after link auto-delete on expire
+            family_id=link.family_id,
             bank_account=link.bank_account,
             bank_code=link.bank_code,
             bank_name=link.bank_name,

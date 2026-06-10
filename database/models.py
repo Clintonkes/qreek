@@ -96,6 +96,7 @@ class Transaction(Base):
     escrow_address  = Column(String, nullable=True)
     monitoring_id   = Column(String, nullable=True)
     source_pool_id  = Column(String, nullable=True)  # for pool collection links: the actual FiatPool.id so history survives link auto-delete on expire
+    family_id       = Column(String, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
 
 
@@ -329,6 +330,7 @@ class PaymentLink(Base):
     code           = Column(String, unique=True, default=lambda: uuid.uuid4().hex[:8].upper())
     created_by     = Column(String, ForeignKey("users.phone"), nullable=False)
     pool_id        = Column(String, nullable=True)
+    family_id      = Column(String, nullable=True)
     title          = Column(String, nullable=False)
     description    = Column(String, nullable=True)
     # Fixed amount or flexible (payer enters amount)
@@ -347,6 +349,73 @@ class PaymentLink(Base):
     expires_at     = Column(DateTime, nullable=True)
     is_active      = Column(Boolean, default=True)
     created_at     = Column(DateTime, default=datetime.utcnow)
+
+
+class FamilyGroup(Base):
+    __tablename__        = "family_groups"
+    id                   = Column(String, primary_key=True, default=lambda: "fam_" + uuid.uuid4().hex[:8].upper())
+    name                 = Column(String, nullable=False)
+    description          = Column(Text, nullable=True)
+    creator_phone        = Column(String, ForeignKey("users.phone"), nullable=False)
+    invite_code          = Column(String, unique=True, default=lambda: uuid.uuid4().hex[:6].upper())
+    balance_ngn          = Column(Float, default=0.0)
+    total_contributed    = Column(Float, default=0.0)
+    total_transferred    = Column(Float, default=0.0)
+    member_count         = Column(Integer, default=1)
+    is_active            = Column(Boolean, default=True)
+    created_at           = Column(DateTime, default=datetime.utcnow)
+    members              = relationship("FamilyMember", back_populates="family", cascade="all, delete-orphan")
+    requests             = relationship("FamilyRequest", back_populates="family", cascade="all, delete-orphan")
+    transfers            = relationship("FamilyTransfer", back_populates="family", cascade="all, delete-orphan")
+
+
+class FamilyMember(Base):
+    __tablename__ = "family_members"
+    id            = Column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    family_id     = Column(String, ForeignKey("family_groups.id", ondelete="CASCADE"), nullable=False)
+    user_phone    = Column(String, ForeignKey("users.phone"), nullable=False)
+    display_name  = Column(String, nullable=True)
+    role          = Column(String, default="member")
+    joined_at     = Column(DateTime, default=datetime.utcnow)
+    family        = relationship("FamilyGroup", back_populates="members")
+
+
+class FamilyRequest(Base):
+    __tablename__   = "family_requests"
+    id              = Column(String, primary_key=True, default=lambda: "fr_" + uuid.uuid4().hex[:10])
+    family_id       = Column(String, ForeignKey("family_groups.id", ondelete="CASCADE"), nullable=False)
+    requested_by    = Column(String, ForeignKey("users.phone"), nullable=False)
+    title           = Column(String, nullable=False)
+    amount          = Column(Float, nullable=False)
+    note            = Column(Text, nullable=True)
+    due_date        = Column(DateTime, nullable=True)
+    status          = Column(String, default="active")
+    approved_by     = Column(String, nullable=True)
+    approved_at     = Column(DateTime, nullable=True)
+    total_collected = Column(Float, default=0.0)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    family          = relationship("FamilyGroup", back_populates="requests")
+
+
+class FamilyTransfer(Base):
+    __tablename__   = "family_transfers"
+    id              = Column(String, primary_key=True, default=lambda: "ft_" + uuid.uuid4().hex[:10].upper())
+    family_id       = Column(String, ForeignKey("family_groups.id", ondelete="CASCADE"), nullable=False)
+    requested_by    = Column(String, ForeignKey("users.phone"), nullable=False)
+    beneficiary_name = Column(String, nullable=False)
+    beneficiary_phone = Column(String, nullable=True)
+    bank_account    = Column(String, nullable=False)
+    bank_code       = Column(String, nullable=False)
+    bank_name       = Column(String, nullable=False)
+    amount          = Column(Float, nullable=False)
+    note            = Column(Text, nullable=True)
+    status          = Column(String, default="pending")
+    source_request_id = Column(String, nullable=True)
+    completed_by    = Column(String, nullable=True)
+    completed_at    = Column(DateTime, nullable=True)
+    failure_reason  = Column(Text, nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    family          = relationship("FamilyGroup", back_populates="transfers")
 
 
 class AuditLog(Base):
