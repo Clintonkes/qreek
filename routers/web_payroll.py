@@ -16,25 +16,26 @@ Flow:
    updates (pending -> processing -> completed/failed).
 5. Analytics: Provides organization-wide spending insights and department-level breakdowns.
 """
-import asyncio, uuid
+import asyncio, csv, io, uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from pydantic import BaseModel
 from typing import Optional, List
 
 from database.session import get_db
-from database.models import Company, Employee, PayrollRun, PayrollEntry, AuditLog, User
+from database.models import Company, Employee, PayrollRun, PayrollEntry, AuditLog, User, Transaction
 from core.web_jwt import decode_token
 from core.banks import resolve_bank, BANKS
 from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin
-from services.payment_service import debit_ngn_or_reject, refund_ngn
+from services.payment_service import debit_ngn_or_reject, refund_ngn, debit_company_wallet_or_reject, refund_company_wallet
 from core.payout import best_payout, settle_fee
 
 router = APIRouter(prefix="/api/v1/payroll", tags=["payroll"])
 
-FEE_PCT = 0.0025   # 0.25% per direct payroll payment
+FEE_PCT = 0.0015   # 0.15% per direct payroll payment
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -94,7 +95,7 @@ def _co_dict(c: Company) -> dict:
     return {
         "id": c.id, "name": c.name, "industry": c.industry,
         "rc_number": c.rc_number, "email": c.email, "address": c.address,
-        "total_paid_ngn": c.total_paid_ngn, "employee_count": c.employee_count,
+        "total_paid_ngn": c.total_paid_ngn, "wallet_balance_ngn": c.wallet_balance_ngn or 0, "employee_count": c.employee_count,
         "is_verified": c.is_verified, "created_at": c.created_at.isoformat() if c.created_at else None,
     }
 
@@ -456,7 +457,7 @@ async def create_run(
             "gross_amount": gross, "fee": fee, "net_amount": net,
         })
 
-    total_fee = round(total_gross * FEE_PCT, 2)
+    total_fee = round(sum(ed["fee"] for ed in entry_data), 2)
     total_net = round(total_gross - total_fee, 2)
 
     # Create the run in PENDING state
@@ -547,7 +548,7 @@ async def execute_run(
             raise HTTPException(status_code=403, detail="Account frozen after 5 failed PIN attempts.")
         raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
 
-    await debit_ngn_or_reject(db, phone, run.total_gross)
+    await debit_company_wallet_or_reject(db, co.id, run.total_gross)
 
     # Mark as processing
     run.status = "processing"
@@ -575,13 +576,28 @@ async def execute_run(
                     entry.provider = result.get("provider")
                     entry.reference = ref
                     entry.paid_at  = datetime.utcnow()
+                    entry.qreek_fee    = entry.fee
+                    entry.provider_fee = 0.0
                     run.paid_count = (run.paid_count or 0) + 1
                 except Exception as e:
                     entry.status    = "failed"
                     entry.error_msg = str(e)[:200]
+                    entry.qreek_fee    = 0.0
+                    entry.provider_fee = 0.0
                     run.failed_count = (run.failed_count or 0) + 1
-                    await refund_ngn(sess, phone, entry.gross_amount)
+                    await refund_company_wallet(sess, co.id, entry.gross_amount)
 
+                # Record transaction
+                tx = Transaction(
+                    user_phone=phone, tx_type="payroll",
+                    currency="NGN", amount=entry.net_amount,
+                    ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
+                    qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
+                    net_amount=entry.net_amount, status=entry.status,
+                    provider=entry.provider, reference=entry.reference,
+                    payment_description=f"Payroll {run.period_label} — {entry.employee_name}",
+                )
+                sess.add(tx)
                 sess.add(entry)
                 await sess.flush()
 
@@ -632,6 +648,298 @@ async def cancel_run(
     run.status = "failed"
     await db.commit()
     return {"message": "Payroll run cancelled."}
+
+
+@router.post("/runs/{run_id}/entries/{entry_id}/retry")
+async def retry_entry(
+    run_id: str,
+    entry_id: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry a single failed payroll entry. Re-debits the company wallet and re-fires the payout."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+
+    r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
+    run = r.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if run.status not in ("partial", "failed"):
+        raise HTTPException(status_code=400, detail="Can only retry entries from runs with failures.")
+
+    er   = await db.execute(select(PayrollEntry).where(PayrollEntry.id == entry_id, PayrollEntry.run_id == run_id))
+    entry = er.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found.")
+    if entry.status != "failed":
+        raise HTTPException(status_code=400, detail="Entry is not in failed status.")
+
+    # Re-debit gross (refund_company_wallet would have returned it on failure)
+    await debit_company_wallet_or_reject(db, co.id, entry.gross_amount)
+
+    bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
+    ref  = "QRK_PR_RETRY_" + uuid.uuid4().hex[:10].upper()
+    try:
+        result = await best_payout(phone, entry.net_amount, bank, ref)
+        await settle_fee(phone, entry.fee, ref)
+        entry.status    = "completed"
+        entry.provider  = result.get("provider")
+        entry.reference = ref
+        entry.error_msg = None
+        entry.paid_at   = datetime.utcnow()
+        entry.qreek_fee    = entry.fee
+        entry.provider_fee = 0.0
+        run.paid_count  = (run.paid_count or 0) + 1
+        run.failed_count = max(0, (run.failed_count or 1) - 1)
+    except Exception as e:
+        entry.status    = "failed"
+        entry.error_msg = str(e)[:200]
+        await refund_company_wallet(db, co.id, entry.gross_amount)
+        await db.commit()
+        raise HTTPException(status_code=502, detail=f"Retry failed: {e}")
+
+    # Record transaction
+    tx = Transaction(
+        user_phone=phone, tx_type="payroll_retry",
+        currency="NGN", amount=entry.net_amount,
+        ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
+        qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
+        net_amount=entry.net_amount, status=entry.status,
+        provider=entry.provider, reference=entry.reference,
+        payment_description=f"Payroll retry {run.period_label} — {entry.employee_name}",
+    )
+    db.add(tx)
+
+    # Recalculate run status
+    if run.failed_count == 0:
+        run.status = "completed"
+    elif run.failed_count > 0 and run.paid_count > 0:
+        run.status = "partial"
+    else:
+        run.status = "failed"
+
+    await db.commit()
+    return {"message": f"Entry for {entry.employee_name} retried successfully.", "entry": _entry_dict(entry)}
+
+
+@router.post("/runs/{run_id}/retry-failed")
+async def retry_all_failed(
+    run_id: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry all failed entries in a run."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+
+    r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
+    run = r.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if run.status not in ("partial", "failed"):
+        raise HTTPException(status_code=400, detail="No failed entries to retry.")
+
+    er      = await db.execute(select(PayrollEntry).where(PayrollEntry.run_id == run_id, PayrollEntry.status == "failed"))
+    failed  = er.scalars().all()
+    if not failed:
+        raise HTTPException(status_code=400, detail="No failed entries to retry.")
+
+    results = {"success": 0, "failed": 0, "details": []}
+    for entry in failed:
+        try:
+            await debit_company_wallet_or_reject(db, co.id, entry.gross_amount)
+            bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
+            ref  = "QRK_PR_RETRY_" + uuid.uuid4().hex[:10].upper()
+            result = await best_payout(phone, entry.net_amount, bank, ref)
+            await settle_fee(phone, entry.fee, ref)
+            entry.status    = "completed"
+            entry.provider  = result.get("provider")
+            entry.reference = ref
+            entry.error_msg = None
+            entry.paid_at   = datetime.utcnow()
+            entry.qreek_fee    = entry.fee
+            entry.provider_fee = 0.0
+            run.paid_count  = (run.paid_count or 0) + 1
+            run.failed_count = max(0, (run.failed_count or 1) - 1)
+            tx = Transaction(
+                user_phone=phone, tx_type="payroll_retry",
+                currency="NGN", amount=entry.net_amount,
+                ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
+                qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
+                net_amount=entry.net_amount, status=entry.status,
+                provider=entry.provider, reference=entry.reference,
+                payment_description=f"Payroll retry {run.period_label} — {entry.employee_name}",
+            )
+            db.add(tx)
+            results["success"] += 1
+            results["details"].append({"employee": entry.employee_name, "status": "completed"})
+        except Exception as e:
+            results["failed"] += 1
+            entry.error_msg = str(e)[:200]
+            try:
+                await refund_company_wallet(db, co.id, entry.gross_amount)
+            except Exception:
+                pass
+            results["details"].append({"employee": entry.employee_name, "status": "failed", "error": str(e)[:100]})
+        db.add(entry)
+
+    if run.failed_count == 0:
+        run.status = "completed"
+    elif run.paid_count > 0:
+        run.status = "partial"
+    else:
+        run.status = "failed"
+
+    await db.commit()
+    return {"message": f"Retried {len(failed)} entries: {results['success']} succeeded, {results['failed']} failed.", **results}
+
+
+# ── Company Wallet ────────────────────────────────────────────────────────────
+
+class WalletDepositIn(BaseModel):
+    amount: float
+
+
+@router.post("/wallet/deposit")
+async def deposit_to_company_wallet(
+    body: WalletDepositIn,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a Flutterwave checkout to fund the company wallet."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Deposit amount must be greater than zero.")
+    if body.amount > 10_000_000:
+        raise HTTPException(status_code=400, detail="Maximum deposit is ₦10,000,000 per transaction.")
+
+    ref = "QRK_WAL_" + uuid.uuid4().hex[:10].upper()
+    tx  = Transaction(
+        user_phone=phone, tx_type="wallet_deposit",
+        currency="NGN", amount=body.amount, ngn_amount=body.amount,
+        gross_amount=body.amount, qreek_fee=0.0, provider_fee=0.0,
+        net_amount=body.amount, status="pending", reference=ref,
+        payment_description=f"Company wallet deposit — {co.name}",
+    )
+    tx.event_metadata = {"company_id": co.id}
+    db.add(tx)
+    await db.flush()
+
+    from services.flutterwave_service import initialize_checkout
+
+    checkout = await initialize_checkout(
+        tx_ref=ref, amount=body.amount,
+        customer_name=co.name, customer_phone=phone,
+        redirect_url=None,
+        title=f"Fund {co.name} wallet",
+        description=f"Deposit ₦{body.amount:,.2f} to {co.name} company wallet",
+        metadata={"company_id": co.id, "tx_ref": ref},
+    )
+
+    tx.provider_checkout_url = checkout.get("data", {}).get("link")
+    await db.commit()
+
+    return {
+        "checkout_url": tx.provider_checkout_url,
+        "reference": ref,
+        "message": "Proceed to Flutterwave checkout to fund your company wallet.",
+    }
+
+
+@router.get("/wallet/balance")
+async def get_wallet_balance(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+    """Get the company wallet balance."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+    return {"wallet_balance_ngn": co.wallet_balance_ngn or 0}
+
+
+# ── CSV Export ────────────────────────────────────────────────────────────────
+
+@router.get("/runs/{run_id}/export")
+async def export_run_csv(
+    run_id: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export payroll run entries as a downloadable CSV file."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+
+    r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
+    run = r.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found.")
+
+    er      = await db.execute(select(PayrollEntry).where(PayrollEntry.run_id == run_id).order_by(PayrollEntry.employee_name))
+    entries = er.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Employee", "Bank", "Account", "Gross", "Fee", "Net", "Status", "Reference", "Paid At", "Error"])
+    for e in entries:
+        writer.writerow([
+            e.employee_name, e.bank_name, e.bank_account,
+            e.gross_amount, e.fee, e.net_amount,
+            e.status, e.reference or "",
+            e.paid_at.isoformat() if e.paid_at else "",
+            e.error_msg or "",
+        ])
+
+    output.seek(0)
+    safe_name = run.period_label.replace(" ", "_")
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="payroll_{safe_name}_{run.id[:8]}.csv"'},
+    )
+
+
+# ── Payslip ───────────────────────────────────────────────────────────────────
+
+@router.get("/runs/{run_id}/entries/{entry_id}/payslip")
+async def get_payslip(
+    run_id: str,
+    entry_id: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a payslip for a single payroll entry."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+
+    r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
+    run = r.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found.")
+
+    er   = await db.execute(select(PayrollEntry).where(PayrollEntry.id == entry_id, PayrollEntry.run_id == run_id))
+    entry = er.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found.")
+
+    return {
+        "company": co.name,
+        "company_rc": co.rc_number,
+        "period": run.period_label,
+        "run_id": run.id,
+        "employee": {
+            "name": entry.employee_name,
+            "bank_name": entry.bank_name,
+            "bank_account": "****" + entry.bank_account[-4:] if entry.bank_account else None,
+        },
+        "earnings": {
+            "gross": entry.gross_amount,
+            "fee": entry.fee,
+            "net": entry.net_amount,
+        },
+        "status": entry.status,
+        "reference": entry.reference,
+        "paid_at": entry.paid_at.isoformat() if entry.paid_at else None,
+    }
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────

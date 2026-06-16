@@ -198,6 +198,7 @@ class Company(Base):
     logo_url            = Column(String, nullable=True)
     payment_pin_hash    = Column(String, nullable=True)   # separate payroll PIN if desired
     total_paid_ngn      = Column(Float, default=0.0)
+    wallet_balance_ngn  = Column(Float, default=0.0)
     employee_count      = Column(Integer, default=0)
     is_verified         = Column(Boolean, default=False)  # admin-verified for higher limits
     created_at          = Column(DateTime, default=datetime.utcnow)

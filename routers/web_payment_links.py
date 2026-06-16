@@ -154,11 +154,10 @@ def _public_pool_payment_dict(tx: Transaction) -> dict:
         "reference": tx.reference,
         "created_at": tx.created_at.isoformat() if tx.created_at else None,
         "amount": tx.net_amount or tx.ngn_amount or tx.amount,
-        "payer_name": tx.payer_name or "",
-        "payer_phone": tx.payer_phone or "",
+        "payer_name": tx.payer_name or "Anonymous",
+        "payer_phone": masked_phone,
         "payment_description": tx.payment_description,
         "status": tx.status,
-        "payout_status": tx.payout_status,
     }
 
 
@@ -570,9 +569,7 @@ async def create_link(
     # (override at checkout time + always-split path in finalize, no transfer fallback).
     # Enforce still applies: you can't create a second active personal link while one exists.
     #
-    # System with error: multiple links, or stuck with bad sub on the "canonical" one; payments
-    # didn't split correctly at success.
-    # System with fix: one link per user, edit bank to test/switch, fresh correct sub, split
+    # one link per user, edit bank to test/switch, fresh correct sub, split
     # always happens at success for the payment.
     existing_link_result = await db.execute(
         select(PaymentLink).where(
@@ -976,7 +973,6 @@ async def resolve_link(code: str, db: AsyncSession = Depends(get_db)):
                 "reference": t.reference,
                 "payment_description": t.payment_description,
                 "status": t.status,
-                "payout_status": t.payout_status,
             })
         resp["recent_contributions"] = recent
         resp["pool_total_via_link"] = link.total_collected or 0
