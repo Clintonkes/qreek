@@ -35,7 +35,7 @@ from core.payout import best_payout, settle_fee
 
 router = APIRouter(prefix="/api/v1/payroll", tags=["payroll"])
 
-FEE_PCT = 0.0015   # 0.15% per direct payroll payment
+FEE_PCT = 0.002    # 0.2% per direct payroll payment
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
