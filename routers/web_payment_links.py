@@ -155,7 +155,7 @@ def _public_pool_payment_dict(tx: Transaction) -> dict:
         "created_at": tx.created_at.isoformat() if tx.created_at else None,
         "amount": tx.net_amount or tx.ngn_amount or tx.amount,
         "payer_name": tx.payer_name or "Anonymous",
-        "payer_phone": masked_phone,
+        "payer_phone": tx.payer_phone,
         "payment_description": tx.payment_description,
         "status": tx.status,
     }

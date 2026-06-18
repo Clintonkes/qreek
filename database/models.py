@@ -194,7 +194,7 @@ class Company(Base):
     industry            = Column(String, nullable=True)
     rc_number           = Column(String, nullable=True)   # CAC registration number
     email               = Column(String, nullable=True)
-    address             = Column(String, nullable=True)
+    address             = Column(String, nullable=False)
     logo_url            = Column(String, nullable=True)
     payment_pin_hash    = Column(String, nullable=True)   # separate payroll PIN if desired
     total_paid_ngn      = Column(Float, default=0.0)

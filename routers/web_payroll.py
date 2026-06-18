@@ -32,6 +32,7 @@ from core.banks import resolve_bank, BANKS
 from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin
 from services.payment_service import debit_ngn_or_reject, refund_ngn, debit_company_wallet_or_reject, refund_company_wallet
 from core.payout import best_payout, settle_fee
+from services.flutterwave_service import resolve_account
 
 router = APIRouter(prefix="/api/v1/payroll", tags=["payroll"])
 
@@ -45,7 +46,7 @@ class CompanyIn(BaseModel):
     industry:   Optional[str] = None
     rc_number:  Optional[str] = None
     email:      Optional[str] = None
-    address:    Optional[str] = None
+    address:    str
 
 
 class EmployeeIn(BaseModel):
@@ -981,6 +982,34 @@ async def get_analytics(claims: dict = Depends(decode_token), db: AsyncSession =
         ],
         "department_breakdown": departments,
     }
+
+
+# ── Bank account verification ──────────────────────────────────────────────────
+
+@router.get("/employees/verify-account")
+async def verify_employee_account(
+    account_number: str,
+    bank_code: str,
+    claims: dict = Depends(decode_token),
+):
+    """
+    Resolves the account name for a given bank account number and bank code
+    using Flutterwave's account resolution API. Returns the account name
+    so the user can confirm it before saving the employee.
+    """
+    try:
+        result = await resolve_account(account_number, bank_code)
+        account_name = None
+        if isinstance(result, dict):
+            data = result.get("data") or result
+            account_name = data.get("account_name") or data.get("accountNumberName") or None
+        if not account_name:
+            raise HTTPException(status_code=400, detail="Could not resolve account name. Verify the bank details.")
+        return {"account_name": account_name}
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail=f"Account verification failed: {str(exc)[:200]}")
 
 
 # ── Banks list ────────────────────────────────────────────────────────────────

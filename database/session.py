@@ -108,6 +108,8 @@ async def _ensure_ledger_columns(conn):
         "CREATE INDEX IF NOT EXISTS ix_payroll_entries_reference ON payroll_entries (reference)",
         "CREATE INDEX IF NOT EXISTS ix_payroll_entries_tx_ref ON payroll_entries (tx_ref)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_payroll_entries_idempotency_key ON payroll_entries (idempotency_key) WHERE idempotency_key IS NOT NULL",
+        "UPDATE companies SET address = '' WHERE address IS NULL",
+        "ALTER TABLE companies ALTER COLUMN address SET NOT NULL",
     ]
     for statement in statements:
         await conn.exec_driver_sql(statement)
