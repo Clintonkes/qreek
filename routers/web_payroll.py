@@ -53,11 +53,22 @@ class EmployeeIn(BaseModel):
     name:        str
     email:       Optional[str] = None
     phone:       Optional[str] = None
-    bank_account: str
-    bank_code:   str
+    bank_account: Optional[str] = None
+    bank_code:   Optional[str] = None
     department:  Optional[str] = None
     job_title:   Optional[str] = None
     salary:      float
+
+
+class EmployeeSelfServiceUpdate(BaseModel):
+    name:        Optional[str] = None
+    email:       Optional[str] = None
+    phone:       Optional[str] = None
+    bank_account: Optional[str] = None
+    bank_code:   Optional[str] = None
+    department:  Optional[str] = None
+    job_title:   Optional[str] = None
+    salary:      Optional[float] = None
 
 
 class EmployeeUpdate(BaseModel):
@@ -106,13 +117,14 @@ def _emp_dict(e: Employee) -> dict:
     Converts an Employee model instance into a dictionary, masking sensitive bank account details.
     """
     return {
-        "id": e.id, "company_id": e.company_id, "name": e.name,
+        "id": e.id, "company_id": e.company_id, "name": e.name or "",
         "email": e.email, "phone": e.phone,
         "bank_account": "****" + e.bank_account[-4:] if e.bank_account else None,
         "bank_account_full": e.bank_account,
         "bank_code": e.bank_code, "bank_name": e.bank_name,
         "department": e.department, "job_title": e.job_title,
         "salary": e.salary, "is_active": e.is_active,
+        "has_details": bool(e.name and e.bank_account and e.salary),
         "created_at": e.created_at.isoformat() if e.created_at else None,
     }
 
@@ -263,20 +275,23 @@ async def add_employee(
     Validates bank details and increments the company's employee count.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co = await _get_company(db, phone)
 
     if body.salary <= 0:
         raise HTTPException(status_code=400, detail="Salary must be greater than 0.")
 
-    bank = resolve_bank(body.bank_code)
-    if not bank:
-        raise HTTPException(status_code=400, detail=f"Invalid bank code: {body.bank_code}")
+    emp_data = body.model_dump(exclude_none=True)
+    if body.bank_code:
+        bank = resolve_bank(body.bank_code)
+        if not bank:
+            raise HTTPException(status_code=400, detail=f"Invalid bank code: {body.bank_code}")
+        emp_data["bank_name"] = bank["name"]
+    else:
+        emp_data["bank_name"] = ""
+    if not body.bank_account:
+        emp_data["bank_account"] = ""
 
-    emp = Employee(
-        company_id=co.id,
-        bank_name=bank["name"],
-        **body.model_dump(exclude_none=True),
-    )
+    emp = Employee(company_id=co.id, **emp_data)
     db.add(emp)
     co.employee_count = (co.employee_count or 0) + 1
     await db.commit()
@@ -385,6 +400,218 @@ async def deactivate_employee(
     co.employee_count = max(0, (co.employee_count or 1) - 1)
     await db.commit()
     return {"message": f"{emp.name} removed from payroll."}
+
+
+@router.post("/employees/{employee_id}/generate-link")
+async def generate_employee_edit_link(
+    employee_id: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generates a unique self-service edit link for an employee.
+    The link can be shared with the employee so they can update their own details.
+    """
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+
+    r   = await db.execute(select(Employee).where(Employee.id == employee_id, Employee.company_id == co.id))
+    emp = r.scalar_one_or_none()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found.")
+
+    token = uuid.uuid4().hex[:16]
+    emp.edit_token = token
+    await db.commit()
+
+    link = f"https://qreekfinance.org/enterprise/employee-edit/{token}"
+    return {"token": token, "link": link, "employee_name": emp.name or ""}
+
+
+@router.post("/employees/generate-invite")
+async def generate_employee_invite(
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Creates or returns a single company-wide invite link that can be shared
+    with all employees. Each employee who opens the link can submit their own
+    details, creating a new employee record under this company.
+    """
+    phone = claims["phone"]
+    co    = await _get_company(db, phone)
+
+    if not co.invite_token:
+        co.invite_token = uuid.uuid4().hex[:16]
+        await db.commit()
+
+    link = f"https://qreekfinance.org/enterprise/employee-edit/{co.invite_token}"
+    return {"token": co.invite_token, "link": link, "company_name": co.name}
+
+
+# ── Employee Self-Service (public, token-authenticated) ──────────────────────
+
+
+@router.get("/employee-self-service/{token}")
+async def get_employee_by_token(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint. Supports two modes:
+    1. Company invite: token matches Company.invite_token → returns company info, no employee
+    2. Employee edit: token matches Employee.edit_token → returns employee data for pre-fill
+    """
+    co_r = await db.execute(select(Company).where(Company.invite_token == token))
+    company = co_r.scalar_one_or_none()
+    if company:
+        return {
+            "mode": "invite",
+            "company_name": company.name,
+        }
+
+    emp_r = await db.execute(select(Employee).where(Employee.edit_token == token))
+    emp = emp_r.scalar_one_or_none()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Invalid or expired link.")
+
+    return {
+        "mode": "edit",
+        "employee": {
+            "id": emp.id,
+            "name": emp.name,
+            "email": emp.email,
+            "phone": emp.phone,
+            "department": emp.department,
+            "job_title": emp.job_title,
+            "salary": emp.salary,
+            "bank_account_masked": "****" + emp.bank_account[-4:] if emp.bank_account else None,
+            "bank_code": emp.bank_code,
+            "bank_name": emp.bank_name,
+            "has_details": bool(emp.name and emp.bank_account and emp.salary),
+        }
+    }
+
+
+@router.put("/employee-self-service/{token}")
+async def update_employee_by_token(
+    token: str,
+    body: EmployeeSelfServiceUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint. Supports two modes:
+    1. Company invite: token matches Company.invite_token → creates a NEW employee record
+    2. Employee edit: token matches Employee.edit_token → updates existing employee
+    Verifies bank account via Flutterwave before saving in both cases.
+    """
+    co_r = await db.execute(select(Company).where(Company.invite_token == token))
+    company = co_r.scalar_one_or_none()
+
+    if company:
+        # Mode 1: Company invite — create new employee
+        if not body.name or not body.name.strip():
+            raise HTTPException(status_code=400, detail="Full name is required.")
+        if not body.salary or body.salary <= 0:
+            raise HTTPException(status_code=400, detail="A valid salary is required.")
+        if not body.bank_account or not body.bank_code:
+            raise HTTPException(status_code=400, detail="Bank account and bank code are required.")
+
+        try:
+            result = await resolve_account(body.bank_account, body.bank_code)
+            account_name = None
+            if isinstance(result, dict):
+                data = result.get("data") or result
+                account_name = data.get("account_name") or data.get("accountNumberName")
+            if not account_name:
+                raise HTTPException(status_code=400, detail="Could not verify bank account. Check the details.")
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(status_code=400, detail=f"Bank verification failed: {str(exc)[:200]}")
+
+        bank = resolve_bank(body.bank_code)
+        bank_name = bank["name"] if bank else ""
+
+        emp = Employee(
+            company_id=company.id,
+            name=body.name.strip(),
+            email=body.email,
+            phone=body.phone,
+            bank_account=body.bank_account,
+            bank_code=body.bank_code,
+            bank_name=bank_name,
+            department=body.department,
+            job_title=body.job_title,
+            salary=body.salary,
+        )
+        db.add(emp)
+        company.employee_count = (company.employee_count or 0) + 1
+        await db.commit()
+        await db.refresh(emp)
+
+        return {
+            "mode": "invite",
+            "message": "Your details have been submitted successfully.",
+            "employee": {
+                "name": emp.name,
+                "email": emp.email,
+                "phone": emp.phone,
+                "department": emp.department,
+                "job_title": emp.job_title,
+                "salary": emp.salary,
+                "bank_name": emp.bank_name,
+            }
+        }
+
+    # Mode 2: Employee edit — update existing
+    emp_r = await db.execute(select(Employee).where(Employee.edit_token == token))
+    emp = emp_r.scalar_one_or_none()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Invalid or expired link.")
+
+    updates = body.model_dump(exclude_none=True)
+
+    if "bank_account" in updates or "bank_code" in updates:
+        bank_account = updates.get("bank_account", emp.bank_account)
+        bank_code    = updates.get("bank_code", emp.bank_code)
+        try:
+            result = await resolve_account(bank_account, bank_code)
+            account_name = None
+            if isinstance(result, dict):
+                data = result.get("data") or result
+                account_name = data.get("account_name") or data.get("accountNumberName")
+            if not account_name:
+                raise HTTPException(status_code=400, detail="Could not verify bank account. Check the details.")
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(status_code=400, detail=f"Bank verification failed: {str(exc)[:200]}")
+
+    if "bank_code" in updates:
+        bank = resolve_bank(updates["bank_code"])
+        if not bank:
+            raise HTTPException(status_code=400, detail=f"Invalid bank code: {updates['bank_code']}")
+        updates["bank_name"] = bank["name"]
+
+    for k, v in updates.items():
+        setattr(emp, k, v)
+
+    await db.commit()
+    await db.refresh(emp)
+    return {
+        "mode": "edit",
+        "message": "Your details have been updated successfully.",
+        "employee": {
+            "name": emp.name,
+            "email": emp.email,
+            "phone": emp.phone,
+            "department": emp.department,
+            "job_title": emp.job_title,
+            "salary": emp.salary,
+            "bank_name": emp.bank_name,
+        }
+    }
 
 
 @router.get("/departments")

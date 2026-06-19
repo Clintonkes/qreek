@@ -201,6 +201,7 @@ class Company(Base):
     wallet_balance_ngn  = Column(Float, default=0.0)
     employee_count      = Column(Integer, default=0)
     is_verified         = Column(Boolean, default=False)  # admin-verified for higher limits
+    invite_token        = Column(String, unique=True, nullable=True)  # single company-wide invite link
     created_at          = Column(DateTime, default=datetime.utcnow)
     employees           = relationship("Employee", back_populates="company", lazy="dynamic")
     payroll_runs        = relationship("PayrollRun", back_populates="company", lazy="dynamic")
@@ -211,17 +212,18 @@ class Employee(Base):
     __tablename__    = "employees"
     id               = Column(String, primary_key=True, default=lambda: "emp_" + uuid.uuid4().hex[:10])
     company_id       = Column(String, ForeignKey("companies.id"), nullable=False)
-    name             = Column(String, nullable=False)
+    name             = Column(String, nullable=True)
     email            = Column(String, nullable=True)
     phone            = Column(String, nullable=True)
-    bank_account     = Column(String, nullable=False)
-    bank_code        = Column(String, nullable=False)
-    bank_name        = Column(String, nullable=False)
+    bank_account     = Column(String, nullable=True)
+    bank_code        = Column(String, nullable=True)
+    bank_name        = Column(String, nullable=True)
     department       = Column(String, nullable=True)
     job_title        = Column(String, nullable=True)
-    salary           = Column(Float, nullable=False)   # base monthly salary in NGN
+    salary           = Column(Float, nullable=True)   # base monthly salary in NGN
     is_active        = Column(Boolean, default=True)
     qreek_phone      = Column(String, nullable=True)   # linked Qreek account if any
+    edit_token       = Column(String, unique=True, nullable=True)  # self-service edit token
     created_at       = Column(DateTime, default=datetime.utcnow)
     company          = relationship("Company", back_populates="employees")
 
