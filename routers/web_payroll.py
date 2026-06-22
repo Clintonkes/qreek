@@ -16,7 +16,7 @@ Flow:
    updates (pending -> processing -> completed/failed).
 5. Analytics: Provides organization-wide spending insights and department-level breakdowns.
 """
-import asyncio, csv, io, uuid
+import asyncio, csv, io, uuid, re
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -424,7 +424,8 @@ async def generate_employee_edit_link(
     emp.edit_token = token
     await db.commit()
 
-    link = f"https://qreekfinance.org/enterprise/employee-edit/{token}"
+    slug = re.sub(r'[^a-z0-9]+', '-', co.name.lower()).strip('-') if co.name else 'general'
+    link = f"https://qreekfinance.org/invite/{slug}/{token}"
     return {"token": token, "link": link, "employee_name": emp.name or ""}
 
 
@@ -445,7 +446,8 @@ async def generate_employee_invite(
         co.invite_token = uuid.uuid4().hex[:16]
         await db.commit()
 
-    link = f"https://qreekfinance.org/enterprise/employee-edit/{co.invite_token}"
+    slug = re.sub(r'[^a-z0-9]+', '-', co.name.lower()).strip('-') if co.name else 'general'
+    link = f"https://qreekfinance.org/invite/{slug}/{co.invite_token}"
     return {"token": co.invite_token, "link": link, "company_name": co.name}
 
 
