@@ -164,13 +164,20 @@ def _entry_dict(e: PayrollEntry) -> dict:
 async def _get_company(db: AsyncSession, phone: str, company_id: str = None) -> Company:
     """
     Helper to fetch the company associated with a user's phone number.
-    Raises 404 if no company is registered.
+    If a company_id is provided but not found (e.g., stale localStorage), falls
+    back to the user's most recent company. Raises 404 only if no company exists at all.
     """
-    q = select(Company).where(Company.owner_phone == phone)
     if company_id:
-        q = q.where(Company.id == company_id)
-    else:
-        q = q.order_by(Company.created_at.desc())
+        # Try fetching the specific company first
+        q = select(Company).where(Company.owner_phone == phone, Company.id == company_id)
+        r = await db.execute(q)
+        co = r.first()
+        if co:
+            return co[0]
+        # company_id was stale/invalid – fall through to pick any company
+
+    # Fallback: return the user's most recent company
+    q = select(Company).where(Company.owner_phone == phone).order_by(Company.created_at.desc())
     r = await db.execute(q)
     co = r.first()
     if not co:
@@ -629,8 +636,7 @@ async def update_employee_by_token(
 
 
 @router.get("/departments")
-async def list_departments(
-    company_id: Optional[str] = Header(None, alias="x-company-id"),claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+async def list_departments(company_id: Optional[str] = Header(None, alias="x-company-id"),claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
     """
     Returns a distinct list of all departments existing in the company's roster.
     """
@@ -878,6 +884,7 @@ async def cancel_run(
     run_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Cancels a pending payroll run, preventing it from being executed.
@@ -903,6 +910,7 @@ async def retry_entry(
     entry_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """Retry a single failed payroll entry. Re-debits the company wallet and re-fires the payout."""
     phone = claims["phone"]
@@ -975,6 +983,7 @@ async def retry_all_failed(
     run_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """Retry all failed entries in a run."""
     phone = claims["phone"]
@@ -1053,6 +1062,7 @@ async def deposit_to_company_wallet(
     body: WalletDepositIn,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """Create a Flutterwave checkout to fund the company wallet."""
     phone = claims["phone"]
@@ -1097,7 +1107,8 @@ async def deposit_to_company_wallet(
 
 
 @router.get("/wallet/balance")
-async def get_wallet_balance(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+async def get_wallet_balance(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db), company_id: Optional[str] = Header(None, alias="x-company-id"),
+):
     """Get the company wallet balance."""
     phone = claims["phone"]
     co    = await _get_company(db, phone, company_id)
@@ -1111,6 +1122,7 @@ async def export_run_csv(
     run_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """Export payroll run entries as a downloadable CSV file."""
     phone = claims["phone"]
@@ -1153,6 +1165,7 @@ async def get_payslip(
     entry_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """Generate a payslip for a single payroll entry."""
     phone = claims["phone"]
@@ -1192,7 +1205,8 @@ async def get_payslip(
 # ── Analytics ─────────────────────────────────────────────────────────────────
 
 @router.get("/analytics")
-async def get_analytics(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+async def get_analytics(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db), company_id: Optional[str] = Header(None, alias="x-company-id"),
+):
     """
     Retrieves high-level payroll analytics, including total disbursements, run history, and department spending.
     """
