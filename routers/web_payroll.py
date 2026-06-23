@@ -18,7 +18,7 @@ Flow:
 """
 import asyncio, csv, io, uuid, re
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
@@ -104,11 +104,13 @@ def _co_dict(c: Company) -> dict:
     """
     Converts a Company model instance into a dictionary for JSON response.
     """
+    slug = __import__("re").sub(r'[^a-z0-9]+', '-', c.name.lower()).strip('-') if c.name else 'general'
+    link = f"https://qreekfinance.org/invite/{slug}/{c.invite_token}" if c.invite_token else None
     return {
         "id": c.id, "name": c.name, "industry": c.industry,
         "rc_number": c.rc_number, "email": c.email, "address": c.address,
         "total_paid_ngn": c.total_paid_ngn, "wallet_balance_ngn": c.wallet_balance_ngn or 0, "employee_count": c.employee_count,
-        "is_verified": c.is_verified, "created_at": c.created_at.isoformat() if c.created_at else None,
+        "is_verified": c.is_verified, "invite_link": link, "created_at": c.created_at.isoformat() if c.created_at else None,
     }
 
 
@@ -159,16 +161,21 @@ def _entry_dict(e: PayrollEntry) -> dict:
     }
 
 
-async def _get_company(db: AsyncSession, phone: str) -> Company:
+async def _get_company(db: AsyncSession, phone: str, company_id: str = None) -> Company:
     """
     Helper to fetch the company associated with a user's phone number.
     Raises 404 if no company is registered.
     """
-    r = await db.execute(select(Company).where(Company.owner_phone == phone))
-    co = r.scalar_one_or_none()
+    q = select(Company).where(Company.owner_phone == phone)
+    if company_id:
+        q = q.where(Company.id == company_id)
+    else:
+        q = q.order_by(Company.created_at.desc())
+    r = await db.execute(q)
+    co = r.first()
     if not co:
-        raise HTTPException(status_code=404, detail="No company registered. Set up your company first.")
-    return co
+        raise HTTPException(status_code=404, detail="No company registered or found.")
+    return co[0]
 
 
 async def _log(db: AsyncSession, phone: str, action: str, entity_type: str = None,
@@ -189,14 +196,14 @@ async def _log(db: AsyncSession, phone: str, action: str, entity_type: str = Non
 @router.get("/company")
 async def get_company(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
     """
-    Retrieves the company profile for the authenticated owner.
+    Retrieves the company profiles for the authenticated owner.
     """
     phone = claims["phone"]
-    r     = await db.execute(select(Company).where(Company.owner_phone == phone))
-    co    = r.scalar_one_or_none()
-    if not co:
-        return {"company": None}
-    return {"company": _co_dict(co)}
+    r     = await db.execute(select(Company).where(Company.owner_phone == phone).order_by(Company.created_at.desc()))
+    cos   = r.scalars().all()
+    if not cos:
+        return {"company": None, "companies": []}
+    return {"company": _co_dict(cos[0]), "companies": [_co_dict(c) for c in cos]}
 
 
 @router.post("/company")
@@ -209,9 +216,6 @@ async def create_company(
     Registers a new company profile for an authenticated user.
     """
     phone = claims["phone"]
-    exists = await db.execute(select(Company).where(Company.owner_phone == phone))
-    if exists.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Company already registered for this account.")
 
     co = Company(owner_phone=phone, **body.model_dump(exclude_none=True))
     db.add(co)
@@ -225,12 +229,13 @@ async def update_company(
     body: CompanyIn,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Updates the existing company profile details.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
     for k, v in body.model_dump(exclude_none=True).items():
         setattr(co, k, v)
     await db.commit()
@@ -245,12 +250,13 @@ async def list_employees(
     active_only: bool = True,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Lists all employees in the user's company, with optional filtering by department and active status.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     q = select(Employee).where(Employee.company_id == co.id)
     if active_only:
@@ -269,13 +275,14 @@ async def add_employee(
     body: EmployeeIn,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Adds a new employee to the company roster.
     Validates bank details and increments the company's employee count.
     """
     phone = claims["phone"]
-    co = await _get_company(db, phone)
+    co = await _get_company(db, phone, company_id)
 
     if body.salary <= 0:
         raise HTTPException(status_code=400, detail="Salary must be greater than 0.")
@@ -304,13 +311,14 @@ async def bulk_add_employees(
     body: BulkEmployeeIn,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Imports multiple employees at once.
     Validates each record and returns a summary of successes and failures.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     if not body.employees:
         raise HTTPException(status_code=400, detail="No employees provided.")
@@ -345,13 +353,14 @@ async def update_employee(
     body: EmployeeUpdate,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Updates an employee's details (salary, department, job title, bank info, or active status).
     Synchronizes the company's employee count if the active status changes.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(Employee).where(Employee.id == employee_id, Employee.company_id == co.id))
     emp = r.scalar_one_or_none()
@@ -384,12 +393,13 @@ async def deactivate_employee(
     employee_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Deactivates an employee (soft delete) and decrements the company's employee count.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(Employee).where(Employee.id == employee_id, Employee.company_id == co.id))
     emp = r.scalar_one_or_none()
@@ -407,13 +417,14 @@ async def generate_employee_edit_link(
     employee_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Generates a unique self-service edit link for an employee.
     The link can be shared with the employee so they can update their own details.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(Employee).where(Employee.id == employee_id, Employee.company_id == co.id))
     emp = r.scalar_one_or_none()
@@ -433,14 +444,15 @@ async def generate_employee_edit_link(
 async def generate_employee_invite(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
-    Creates or returns a single company-wide invite link that can be shared
+    Creates or generates a single company-wide invite link that can be shared
     with all employees. Each employee who opens the link can submit their own
     details, creating a new employee record under this company.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     if not co.invite_token:
         co.invite_token = uuid.uuid4().hex[:16]
@@ -617,12 +629,13 @@ async def update_employee_by_token(
 
 
 @router.get("/departments")
-async def list_departments(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
+async def list_departments(
+    company_id: Optional[str] = Header(None, alias="x-company-id"),claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
     """
     Returns a distinct list of all departments existing in the company's roster.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
     r     = await db.execute(
         select(Employee.department).where(Employee.company_id == co.id, Employee.department != None).distinct()
     )
@@ -635,12 +648,13 @@ async def list_departments(claims: dict = Depends(decode_token), db: AsyncSessio
 async def list_runs(
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Lists the history of payroll runs for the company.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
     r     = await db.execute(
         select(PayrollRun).where(PayrollRun.company_id == co.id).order_by(desc(PayrollRun.created_at)).limit(50)
     )
@@ -653,13 +667,14 @@ async def create_run(
     body: PayrollRunIn,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Preview a payroll run. Returns calculated totals without executing.
     Call POST /runs/{id}/execute with PIN to actually fire the payments.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     # Fetch employees
     q = select(Employee).where(Employee.company_id == co.id, Employee.is_active == True)
@@ -730,12 +745,13 @@ async def get_run(
     run_id: str,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """
     Retrieves the details of a specific payroll run, including all individual employee entries.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
     run = r.scalar_one_or_none()
@@ -755,10 +771,11 @@ async def execute_run(
     request: Request,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
     """PIN-confirmed execution. Fires all payouts asynchronously."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
     run = r.scalar_one_or_none()
@@ -866,7 +883,7 @@ async def cancel_run(
     Cancels a pending payroll run, preventing it from being executed.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
     run = r.scalar_one_or_none()
@@ -889,7 +906,7 @@ async def retry_entry(
 ):
     """Retry a single failed payroll entry. Re-debits the company wallet and re-fires the payout."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
     run = r.scalar_one_or_none()
@@ -961,7 +978,7 @@ async def retry_all_failed(
 ):
     """Retry all failed entries in a run."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
     run = r.scalar_one_or_none()
@@ -1039,7 +1056,7 @@ async def deposit_to_company_wallet(
 ):
     """Create a Flutterwave checkout to fund the company wallet."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     if body.amount <= 0:
         raise HTTPException(status_code=400, detail="Deposit amount must be greater than zero.")
@@ -1083,7 +1100,7 @@ async def deposit_to_company_wallet(
 async def get_wallet_balance(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
     """Get the company wallet balance."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
     return {"wallet_balance_ngn": co.wallet_balance_ngn or 0}
 
 
@@ -1097,7 +1114,7 @@ async def export_run_csv(
 ):
     """Export payroll run entries as a downloadable CSV file."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
     run = r.scalar_one_or_none()
@@ -1139,7 +1156,7 @@ async def get_payslip(
 ):
     """Generate a payslip for a single payroll entry."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
     run = r.scalar_one_or_none()
@@ -1180,7 +1197,7 @@ async def get_analytics(claims: dict = Depends(decode_token), db: AsyncSession =
     Retrieves high-level payroll analytics, including total disbursements, run history, and department spending.
     """
     phone = claims["phone"]
-    co    = await _get_company(db, phone)
+    co    = await _get_company(db, phone, company_id)
 
     # Total paid per month (last 6 runs)
     runs_r = await db.execute(
