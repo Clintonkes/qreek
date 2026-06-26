@@ -635,6 +635,44 @@ async def update_employee_by_token(
     }
 
 
+@router.get("/employee-self-service/{token}/verify-account")
+async def verify_account_by_token(
+    token: str,
+    account_number: str,
+    bank_code: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public self-service endpoint. Verifies a bank account number via Flutterwave.
+    Accepts a company invite token or employee edit token for request validation.
+    No JWT authentication required — employees access this via their invite link.
+    """
+    valid = False
+    co_r = await db.execute(select(Company).where(Company.invite_token == token))
+    if co_r.scalar_one_or_none():
+        valid = True
+    if not valid:
+        emp_r = await db.execute(select(Employee).where(Employee.edit_token == token))
+        if emp_r.scalar_one_or_none():
+            valid = True
+    if not valid:
+        raise HTTPException(status_code=404, detail="Invalid or expired link.")
+
+    try:
+        result = await resolve_account(account_number, bank_code)
+        account_name = None
+        if isinstance(result, dict):
+            data = result.get("data") or result
+            account_name = data.get("account_name") or data.get("accountNumberName") or None
+        if not account_name:
+            raise HTTPException(status_code=400, detail="Could not resolve account name. Verify the bank details.")
+        return {"account_name": account_name}
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail=f"Account verification failed: {str(exc)[:200]}")
+
+
 @router.get("/departments")
 async def list_departments(company_id: Optional[str] = Header(None, alias="x-company-id"),claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db)):
     """
