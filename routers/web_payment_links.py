@@ -98,6 +98,11 @@ class ConfirmFlutterwaveIn(BaseModel):
     status:         Optional[str] = None
 
 
+class VerifyBankIn(BaseModel):
+    bank_account: str
+    bank_code: str
+
+
 class UpdateLinkIn(BaseModel):
     """
     Partial update for a payment link. Per requirements, links (for non-pool payments)
@@ -539,6 +544,30 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     await log_payment_event(db, event_type="payout.skipped.no_split_config", reference=tx_ref, transaction_id=transaction_id, status="pending", message=tx.payout_error)
     await db.commit()
     return {"payment": _payment_dict(tx)}
+
+
+@router.post("/verify-bank")
+async def verify_payment_link_bank(
+    body: VerifyBankIn,
+    claims: dict = Depends(decode_token),
+):
+    """
+    Verifies a bank account using Flutterwave's account resolution API.
+    Returns the account name so the user can confirm it before saving the link.
+    """
+    try:
+        result = await resolve_account(body.bank_account, body.bank_code)
+        account_name = None
+        if isinstance(result, dict):
+            data = result.get("data") or result
+            account_name = data.get("account_name") or data.get("accountNumberName") or None
+        if not account_name:
+            raise HTTPException(status_code=400, detail="Could not resolve account name. Verify the bank details.")
+        return {"account_name": account_name}
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail=f"Account verification failed: {str(exc)[:200]}")
 
 
 @router.post("")
