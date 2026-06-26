@@ -312,15 +312,17 @@ async def resolve_account(account_number: str, bank_code: str) -> dict:
     saving for a pool payment link. Returns the resolved account details (incl. account_name)
     or raises FlutterwaveAPIError on failure. This ensures the bank details for pool
     collection links are verified before being saved into our system (per user request).
+    
+    Flutterwave v3 expects a POST request with account_bank (not bank_code) in the body.
     """
     if not account_number or not bank_code:
         raise ValueError("account_number and bank_code required")
-    params = {"account_number": account_number, "bank_code": bank_code}
+    body = {"account_number": account_number, "account_bank": bank_code}
     async with _client() as client:
-        response = await client.get(
+        response = await client.post(
             f"{FLW_BASE_URL}/accounts/resolve",
             headers=_headers(),
-            params=params,
+            json=body,
         )
         if response.is_error:
             raise FlutterwaveAPIError(
