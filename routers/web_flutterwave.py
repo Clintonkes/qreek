@@ -1,14 +1,17 @@
+import asyncio, uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import Company, PayrollEntry, PayrollRun, Transaction
+from database.models import Company, Employee, PayrollEntry, PayrollRun, Transaction
 from database.session import get_db
+from core.payout import best_payout, settle_fee
 from routers.web_payment_links import finalize_flutterwave_link_payment
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import logger, verify_webhook_signature
+from services.flutterwave_service import logger, verify_webhook_signature, verify_transaction
+from services.sms_service import send_sms as send_transfer_sms
 
 router = APIRouter(prefix="/api/v1/flutterwave", tags=["flutterwave"])
 
@@ -66,6 +69,13 @@ async def flutterwave_webhook(request: Request, db: AsyncSession = Depends(get_d
         except Exception as exc:
             logger.exception("Could not finalize payroll transfer %s: %s", tx_ref, exc)
             await log_payment_event(db, event_type="flutterwave.webhook.payroll_transfer_failed", reference=tx_ref, transaction_id=transaction_id, status="failed", message=str(exc)[:1000])
+
+    if tx_ref and str(tx_ref).startswith("QRK_PRCK_"):
+        try:
+            await finalize_payroll_checkout(db, tx_ref, transaction_id, payload)
+        except Exception as exc:
+            logger.exception("Could not finalize payroll checkout %s: %s", tx_ref, exc)
+            await log_payment_event(db, event_type="flutterwave.webhook.payroll_checkout_failed", reference=tx_ref, transaction_id=transaction_id, status="failed", message=str(exc)[:1000])
 
     await db.commit()
     return Response(status_code=200, content="OK")
@@ -125,6 +135,27 @@ async def finalize_payroll_transfer(db: AsyncSession, tx_ref: str, transaction_i
     if status == "successful":
         entry.status = "completed"
         entry.provider_transaction_id = str(transaction_id) if transaction_id else None
+
+        # SMS the employee the moment Flutterwave confirms the transfer
+        try:
+            emp_r = await db.execute(select(Employee).where(Employee.id == entry.employee_id))
+            emp = emp_r.scalar_one_or_none()
+            if emp and emp.phone:
+                pr_r = await db.execute(select(PayrollRun).where(PayrollRun.id == entry.run_id))
+                pr = pr_r.scalar_one_or_none()
+                company_name = ""
+                if pr:
+                    co_r = await db.execute(select(Company).where(Company.id == pr.company_id))
+                    co = co_r.scalar_one_or_none()
+                    company_name = co.name if co else ""
+                await send_transfer_sms(
+                    phone=emp.phone,
+                    message=f"Qreek: ₦{entry.net_amount:,.0f} has been sent to your bank from {company_name or 'your employer'}. Ref: {entry.reference or tx_ref}.",
+                    reference=entry.reference or tx_ref,
+                    db=db,
+                )
+        except Exception:
+            pass
     elif status in ("failed", "reversed"):
         entry.status = "failed"
         entry.error_msg = f"Transfer {status}: {data.get('complete_message', '')}"[:200]
@@ -152,3 +183,151 @@ async def finalize_payroll_transfer(db: AsyncSession, tx_ref: str, transaction_i
     await log_payment_event(db, event_type="payroll.transfer.updated", reference=tx_ref, transaction_id=transaction_id, status=entry.status, payload={"entry_id": entry.id, "employee": entry.employee_name})
     await db.commit()
     return {"status": entry.status}
+
+
+async def finalize_payroll_checkout(db: AsyncSession, tx_ref: str, transaction_id: str | int, payload: dict) -> dict:
+    """
+    Called when a QRK_PRCK_ (payroll checkout) payment succeeds on Flutterwave.
+    Fires all pending payouts for the associated payroll run.
+    """
+    data = payload.get("data", {})
+    flw_status = str(data.get("status", "")).lower()
+
+    if flw_status != "successful":
+        return {"status": "ignored"}
+
+    # Find the transaction record
+    tx_result = await db.execute(select(Transaction).where(Transaction.reference == tx_ref).with_for_update())
+    tx = tx_result.scalar_one_or_none()
+    if not tx or tx.status == "completed":
+        return {"status": "already_completed"}
+
+    # Verify with Flutterwave API
+    verified = await verify_transaction(transaction_id)
+    vdata = verified.get("data", {})
+    vstatus = str(vdata.get("status", "")).lower()
+    if vstatus != "successful":
+        tx.status = "failed"
+        await db.commit()
+        logger.warning("Payroll checkout %s: Flutterwave status is %s", tx_ref, vstatus)
+        return {"status": "failed"}
+
+    company_id = None
+    run_id = None
+    if tx.event_metadata:
+        company_id = tx.event_metadata.get("company_id")
+        run_id = tx.event_metadata.get("run_id")
+
+    if not run_id or not company_id:
+        await log_payment_event(db, event_type="payroll_checkout.finalize.missing_metadata", reference=tx_ref, transaction_id=transaction_id, status="failed")
+        tx.status = "failed"
+        await db.commit()
+        return {"status": "failed"}
+
+    # Find the payroll run
+    r_result = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == company_id).with_for_update())
+    run = r_result.scalar_one_or_none()
+    if not run:
+        tx.status = "failed"
+        await db.commit()
+        logger.warning("Payroll checkout %s: run %s not found", tx_ref, run_id)
+        return {"status": "failed"}
+
+    if run.status not in ("pending",):
+        await log_payment_event(db, event_type="payroll_checkout.finalize.already_processing", reference=tx_ref, transaction_id=transaction_id, status="ignored")
+        return {"status": "already_processing"}
+
+    # Find the company
+    co_result = await db.execute(select(Company).where(Company.id == company_id))
+    co = co_result.scalar_one_or_none()
+
+    # Mark transaction as completed
+    tx.status = "completed"
+    tx.provider_transaction_id = str(transaction_id)
+
+    # Mark run as processing
+    run.status = "processing"
+    await db.commit()
+
+    # Fire all pending payouts
+    er_result = await db.execute(select(PayrollEntry).where(PayrollEntry.run_id == run_id, PayrollEntry.status == "pending"))
+    entries = er_result.scalars().all()
+
+    # Audit log
+    from routers.web_payroll import _log
+    await _log(db, tx.user_phone, "payroll_run_executed", "payroll_run", run.id, run.total_gross, None,
+               {"company": co.name if co else "", "period": run.period_label, "count": len(entries)})
+    await db.commit()
+
+    async def _fire_all():
+        async with __import__("database.session", fromlist=["AsyncSessionLocal"]).AsyncSessionLocal() as sess:
+            for entry in entries:
+                bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
+                ref  = "QRK_PR_" + uuid.uuid4().hex[:10].upper()
+                try:
+                    result = await best_payout(tx.user_phone, entry.net_amount, bank, ref)
+                    await settle_fee(tx.user_phone, entry.fee, ref)
+                    entry.status   = "completed"
+                    entry.provider = result.get("provider")
+                    entry.reference = ref
+                    entry.paid_at  = datetime.utcnow()
+                    entry.qreek_fee    = entry.fee
+                    entry.provider_fee = 0.0
+                    run.paid_count = (run.paid_count or 0) + 1
+
+                    # SMS notification to employee when salary lands
+                    try:
+                        emp_r = await sess.execute(select(Employee).where(Employee.id == entry.employee_id))
+                        emp = emp_r.scalar_one_or_none()
+                        if emp and emp.phone:
+                            await send_transfer_sms(
+                                phone=emp.phone,
+                                message=f"Qreek: ₦{entry.net_amount:,.0f} salary for {run.period_label} from {(co.name if co else 'your employer')} has been sent to your bank. Ref: {ref}.",
+                                reference=ref,
+                                db=sess,
+                            )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    entry.status    = "failed"
+                    entry.error_msg = str(e)[:200]
+                    entry.qreek_fee    = 0.0
+                    entry.provider_fee = 0.0
+                    run.failed_count = (run.failed_count or 0) + 1
+
+                # Record transaction
+                txx = Transaction(
+                    user_phone=tx.user_phone, tx_type="payroll",
+                    currency="NGN", amount=entry.net_amount,
+                    ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
+                    qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
+                    net_amount=entry.net_amount, status=entry.status,
+                    provider=entry.provider, reference=entry.reference,
+                    payment_description=f"Payroll {run.period_label} — {entry.employee_name}",
+                )
+                sess.add(txx)
+                sess.add(entry)
+                await sess.flush()
+
+            if run.failed_count and run.paid_count:
+                run.status = "partial"
+            elif run.failed_count == run.entry_count:
+                run.status = "failed"
+            else:
+                run.status = "completed"
+            run.completed_at = datetime.utcnow()
+
+            co_r = await sess.execute(select(Company).where(Company.id == company_id))
+            co2  = co_r.scalar_one_or_none()
+            if co2:
+                co2.total_paid_ngn = (co2.total_paid_ngn or 0) + run.total_net
+
+            sess.add(run)
+            await sess.commit()
+
+    asyncio.create_task(_fire_all())
+
+    await log_payment_event(db, event_type="payroll_checkout.completed", reference=tx_ref, transaction_id=transaction_id, status="completed",
+                            payload={"run_id": run.id, "amount": run.total_gross, "entry_count": len(entries)})
+    await db.commit()
+    return {"status": "processing", "run_id": run.id}

@@ -33,6 +33,7 @@ from services.security_service import is_frozen, pin_attempts_remaining, verify_
 from services.payment_service import debit_ngn_or_reject, refund_ngn, debit_company_wallet_or_reject, refund_company_wallet
 from core.payout import best_payout, settle_fee
 from services.flutterwave_service import resolve_account
+from services.sms_service import send_sms as send_payout_sms
 
 router = APIRouter(prefix="/api/v1/payroll", tags=["payroll"])
 
@@ -95,6 +96,10 @@ class PayrollRunIn(BaseModel):
 
 
 class ExecuteRunIn(BaseModel):
+    pin: str
+
+
+class PayrollCheckoutIn(BaseModel):
     pin: str
 
 
@@ -294,6 +299,18 @@ async def add_employee(
     if body.salary <= 0:
         raise HTTPException(status_code=400, detail="Salary must be greater than 0.")
 
+    if body.bank_account and body.bank_code:
+        dup = await db.execute(
+            select(Employee).where(
+                Employee.company_id == co.id,
+                Employee.bank_account == body.bank_account,
+                Employee.bank_code == body.bank_code,
+                Employee.is_active == True,
+            )
+        )
+        if dup.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="This bank account is already assigned to another employee in your company.")
+
     emp_data = body.model_dump(exclude_none=True)
     if body.bank_code:
         bank = resolve_bank(body.bank_code)
@@ -341,6 +358,18 @@ async def bulk_add_employees(
         if emp_data.salary <= 0:
             errors.append({"row": i + 1, "name": emp_data.name, "error": "Salary must be > 0"})
             continue
+        if emp_data.bank_account and emp_data.bank_code:
+            dup = await db.execute(
+                select(Employee).where(
+                    Employee.company_id == co.id,
+                    Employee.bank_account == emp_data.bank_account,
+                    Employee.bank_code == emp_data.bank_code,
+                    Employee.is_active == True,
+                )
+            )
+            if dup.scalar_one_or_none():
+                errors.append({"row": i + 1, "name": emp_data.name, "error": "Bank account already assigned to another employee."})
+                continue
         emp = Employee(company_id=co.id, bank_name=bank["name"], **emp_data.model_dump(exclude_none=True))
         db.add(emp)
         added.append(emp_data.name)
@@ -375,6 +404,23 @@ async def update_employee(
         raise HTTPException(status_code=404, detail="Employee not found.")
 
     updates = body.model_dump(exclude_none=True)
+
+    if "bank_account" in updates or "bank_code" in updates:
+        bank_account = updates.get("bank_account", emp.bank_account)
+        bank_code = updates.get("bank_code", emp.bank_code)
+        if bank_account and bank_code:
+            dup = await db.execute(
+                select(Employee).where(
+                    Employee.company_id == co.id,
+                    Employee.bank_account == bank_account,
+                    Employee.bank_code == bank_code,
+                    Employee.is_active == True,
+                    Employee.id != employee_id,
+                )
+            )
+            if dup.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="This bank account is already assigned to another employee.")
+
     if "bank_code" in updates:
         bank = resolve_bank(updates["bank_code"])
         if not bank:
@@ -551,6 +597,18 @@ async def update_employee_by_token(
                 raise
             raise HTTPException(status_code=400, detail=f"Bank verification failed: {str(exc)[:200]}")
 
+        if body.bank_account and body.bank_code:
+            dup = await db.execute(
+                select(Employee).where(
+                    Employee.company_id == company.id,
+                    Employee.bank_account == body.bank_account,
+                    Employee.bank_code == body.bank_code,
+                    Employee.is_active == True,
+                )
+            )
+            if dup.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="This bank account is already assigned to another employee in your company.")
+
         bank = resolve_bank(body.bank_code)
         bank_name = bank["name"] if bank else ""
 
@@ -608,6 +666,19 @@ async def update_employee_by_token(
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(status_code=400, detail=f"Bank verification failed: {str(exc)[:200]}")
+
+        # Duplicate bank check for self-service edit
+        dup = await db.execute(
+            select(Employee).where(
+                Employee.company_id == emp.company_id,
+                Employee.bank_account == bank_account,
+                Employee.bank_code == bank_code,
+                Employee.is_active == True,
+                Employee.id != emp.id,
+            )
+        )
+        if dup.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="This bank account is already assigned to another employee in your company.")
 
     if "bank_code" in updates:
         bank = resolve_bank(updates["bank_code"])
@@ -870,6 +941,20 @@ async def execute_run(
                     entry.qreek_fee    = entry.fee
                     entry.provider_fee = 0.0
                     run.paid_count = (run.paid_count or 0) + 1
+
+                    # SMS notification to employee when salary lands
+                    try:
+                        emp_r = await sess.execute(select(Employee).where(Employee.id == entry.employee_id))
+                        emp = emp_r.scalar_one_or_none()
+                        if emp and emp.phone:
+                            await send_payout_sms(
+                                phone=emp.phone,
+                                message=f"Qreek: ₦{entry.net_amount:,.0f} salary for {run.period_label} from {co.name} has been sent to your bank. Ref: {ref}.",
+                                reference=ref,
+                                db=sess,
+                            )
+                    except Exception:
+                        pass
                 except Exception as e:
                     entry.status    = "failed"
                     entry.error_msg = str(e)[:200]
@@ -1013,6 +1098,21 @@ async def retry_entry(
         run.status = "failed"
 
     await db.commit()
+
+    # SMS notification for retried payout
+    try:
+        emp_r = await db.execute(select(Employee).where(Employee.id == entry.employee_id))
+        emp = emp_r.scalar_one_or_none()
+        if emp and emp.phone:
+            await send_payout_sms(
+                phone=emp.phone,
+                message=f"Qreek: ₦{entry.net_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
+                reference=ref,
+                db=db,
+            )
+    except Exception:
+        pass
+
     return {"message": f"Entry for {entry.employee_name} retried successfully.", "entry": _entry_dict(entry)}
 
 
@@ -1068,6 +1168,20 @@ async def retry_all_failed(
             db.add(tx)
             results["success"] += 1
             results["details"].append({"employee": entry.employee_name, "status": "completed"})
+
+            # SMS notification for retried payout
+            try:
+                emp_r = await db.execute(select(Employee).where(Employee.id == entry.employee_id))
+                emp = emp_r.scalar_one_or_none()
+                if emp and emp.phone:
+                    await send_payout_sms(
+                        phone=emp.phone,
+                        message=f"Qreek: ₦{entry.net_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
+                        reference=ref,
+                        db=db,
+                    )
+            except Exception:
+                pass
         except Exception as e:
             results["failed"] += 1
             entry.error_msg = str(e)[:200]
@@ -1141,6 +1255,78 @@ async def deposit_to_company_wallet(
         "checkout_url": tx.provider_checkout_url,
         "reference": ref,
         "message": "Proceed to Flutterwave checkout to fund your company wallet.",
+    }
+
+
+@router.post("/runs/{run_id}/checkout")
+async def create_payroll_checkout(
+    run_id: str,
+    body: PayrollCheckoutIn,
+    request: Request,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
+):
+    """PIN-gated Flutterwave checkout for payroll. Verifies PIN, then creates a payment link."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone, company_id)
+
+    r   = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
+    run = r.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Payroll run not found.")
+    if run.status not in ("pending",):
+        raise HTTPException(status_code=400, detail=f"Run is already {run.status}. Cannot checkout.")
+
+    if (run.total_gross or 0) <= 0:
+        raise HTTPException(status_code=400, detail="Payroll total must be greater than zero.")
+
+    # Verify PIN before allowing checkout
+    if await is_frozen(db, phone):
+        raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
+
+    ok = await verify_transaction_pin(db, phone, body.pin)
+    if not ok:
+        remaining = await pin_attempts_remaining(db, phone)
+        if remaining <= 0:
+            raise HTTPException(status_code=403, detail="Account frozen after 5 failed PIN attempts.")
+        raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
+
+    ref = "QRK_PRCK_" + uuid.uuid4().hex[:10].upper()
+    tx  = Transaction(
+        user_phone=phone, tx_type="payroll_payment",
+        currency="NGN", amount=run.total_gross, ngn_amount=run.total_gross,
+        gross_amount=run.total_gross, qreek_fee=0.0, provider_fee=0.0,
+        net_amount=run.total_gross, status="pending", reference=ref,
+        payment_description=f"Payroll {run.period_label} — {co.name}",
+    )
+    tx.event_metadata = {"company_id": co.id, "run_id": run.id}
+    db.add(tx)
+    await db.flush()
+
+    from services.flutterwave_service import initialize_checkout
+
+    checkout = await initialize_checkout(
+        tx_ref=ref, amount=run.total_gross,
+        customer_name=co.name, customer_phone=phone,
+        redirect_url=None,
+        title=f"Payroll — {run.period_label}",
+        description=f"Pay ₦{run.total_gross:,.2f} for {run.entry_count} employees — {co.name}",
+        metadata={"company_id": co.id, "run_id": run.id, "tx_ref": ref},
+    )
+
+    tx.provider_checkout_url = checkout.get("data", {}).get("link")
+    await db.commit()
+
+    # Audit log
+    await _log(db, phone, "payroll_checkout_created", "payroll_run", run.id, run.total_gross, request,
+               {"company": co.name, "period": run.period_label, "amount": run.total_gross})
+    await db.commit()
+
+    return {
+        "checkout_url": tx.provider_checkout_url,
+        "reference": ref,
+        "message": "Proceed to Flutterwave checkout to pay for this payroll run.",
     }
 
 
