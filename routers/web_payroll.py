@@ -1281,6 +1281,13 @@ async def create_payroll_checkout(
     if (run.total_gross or 0) <= 0:
         raise HTTPException(status_code=400, detail="Payroll total must be greater than zero.")
 
+    # Check user has a PIN before verifying
+    from database.models import UserSecurity
+    sec_r = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
+    sec = sec_r.scalar_one_or_none()
+    if not sec or not sec.pin_hash:
+        raise HTTPException(status_code=400, detail="You haven't set a transaction PIN yet. Set one in Settings first.")
+
     # Verify PIN before allowing checkout
     if await is_frozen(db, phone):
         raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")

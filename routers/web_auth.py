@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 from database.session import get_db
-from database.models import User
+from database.models import User, UserSecurity
 from services.user_service import get_or_create_user, save_bank, apply_referral
 from services.security_service import set_pin, verify_pin, freeze_account, is_frozen
 from core.web_jwt import decode_token, issue_session_tokens, refresh_session_tokens, revoke_all_sessions, revoke_session
@@ -221,6 +221,40 @@ async def me(claims: dict = Depends(decode_token), db: AsyncSession = Depends(ge
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user_to_dict(user)
+
+
+@router.get("/has-pin")
+async def has_pin(
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check if the authenticated user has set a transaction PIN."""
+    phone = claims["phone"]
+    result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
+    sec = result.scalar_one_or_none()
+    return {"has_pin": bool(sec and sec.pin_hash)}
+
+
+class SetPinBody(BaseModel):
+    new_pin: str
+
+
+@router.post("/set-pin")
+async def set_initial_pin(
+    body: SetPinBody,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a transaction PIN for the first time (no current PIN required)."""
+    phone = claims["phone"]
+    result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
+    sec = result.scalar_one_or_none()
+    if sec and sec.pin_hash:
+        raise HTTPException(status_code=400, detail="PIN already set. Use /change-pin to update it.")
+    if not re.match(r"^\d{4,6}$", body.new_pin):
+        raise HTTPException(status_code=400, detail="PIN must be 4–6 digits")
+    await set_pin(db, phone, body.new_pin)
+    return {"message": "Transaction PIN set successfully"}
 
 
 @router.post("/change-pin")
