@@ -10,7 +10,10 @@ from database.session import get_db
 from core.payout import best_payout, settle_fee
 from routers.web_payment_links import finalize_flutterwave_link_payment
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import logger, verify_webhook_signature, verify_transaction
+import logging
+from services.flutterwave_service import verify_webhook_signature, verify_transaction
+
+logger = logging.getLogger(__name__)
 from services.sms_service import send_sms as send_transfer_sms
 
 router = APIRouter(prefix="/api/v1/flutterwave", tags=["flutterwave"])
@@ -82,6 +85,11 @@ async def flutterwave_webhook(request: Request, db: AsyncSession = Depends(get_d
 
 
 async def finalize_wallet_deposit(db: AsyncSession, tx_ref: str, transaction_id: str | int = None) -> dict:
+    """
+    Credits the company wallet when a QRK_WAL_ Flutterwave checkout succeeds.
+    Verifies the transaction with Flutterwave before crediting to prevent replay attacks.
+    """
+    logger.info("wallet_deposit.finalize.start: ref=%s transaction_id=%s", tx_ref, transaction_id)
     tx_result = await db.execute(select(Transaction).where(Transaction.reference == tx_ref).with_for_update())
     tx = tx_result.scalar_one_or_none()
     if not tx:
@@ -97,6 +105,7 @@ async def finalize_wallet_deposit(db: AsyncSession, tx_ref: str, transaction_id:
     flw_status = str(data.get("status", "")).lower()
 
     if flw_status != "successful":
+        logger.warning("wallet_deposit.verify.failed: ref=%s status=%s", tx_ref, flw_status)
         tx.status = "failed"
         await db.commit()
         raise HTTPException(status_code=400, detail=f"Flutterwave payment status: {flw_status}")
@@ -117,6 +126,7 @@ async def finalize_wallet_deposit(db: AsyncSession, tx_ref: str, transaction_id:
     co.wallet_balance_ngn = round((co.wallet_balance_ngn or 0) + tx.amount, 2)
     tx.status = "completed"
     tx.provider_transaction_id = str(transaction_id)
+    logger.info("wallet_deposit.completed: ref=%s company=%s amount=%.2f new_balance=%.2f", tx_ref, company_id, tx.amount, co.wallet_balance_ngn)
 
     await log_payment_event(db, event_type="wallet_deposit.completed", reference=tx_ref, transaction_id=transaction_id, status="completed", payload={"company_id": company_id, "amount": tx.amount, "new_balance": co.wallet_balance_ngn})
     await db.commit()
@@ -124,8 +134,13 @@ async def finalize_wallet_deposit(db: AsyncSession, tx_ref: str, transaction_id:
 
 
 async def finalize_payroll_transfer(db: AsyncSession, tx_ref: str, transaction_id: str | int, payload: dict) -> dict:
+    """
+    Updates a single employee payout entry when Flutterwave confirms or fails a QRK_PR_ transfer.
+    Handles run-level status rollup (completed/partial/failed) once all entries are resolved.
+    """
     data = payload.get("data", {})
     status = str(data.get("status", "")).lower()
+    logger.info("payroll.transfer.update: ref=%s status=%s", tx_ref, status)
 
     er_result = await db.execute(select(PayrollEntry).where(PayrollEntry.reference == tx_ref).with_for_update())
     entry = er_result.scalar_one_or_none()
@@ -135,6 +150,7 @@ async def finalize_payroll_transfer(db: AsyncSession, tx_ref: str, transaction_i
     if status == "successful":
         entry.status = "completed"
         entry.provider_transaction_id = str(transaction_id) if transaction_id else None
+        logger.info("payroll.transfer.confirmed: ref=%s employee=%r amount=%.2f", tx_ref, entry.employee_name, entry.gross_amount or 0)
 
         # SMS the employee the moment Flutterwave confirms the transfer
         try:
@@ -150,7 +166,7 @@ async def finalize_payroll_transfer(db: AsyncSession, tx_ref: str, transaction_i
                     company_name = co.name if co else ""
                 await send_transfer_sms(
                     phone=emp.phone,
-                    message=f"Qreek: ₦{entry.net_amount:,.0f} has been sent to your bank from {company_name or 'your employer'}. Ref: {entry.reference or tx_ref}.",
+                    message=f"Qreek: ₦{entry.gross_amount:,.0f} has been sent to your bank from {company_name or 'your employer'}. Ref: {entry.reference or tx_ref}.",
                     reference=entry.reference or tx_ref,
                     db=db,
                 )
@@ -159,6 +175,7 @@ async def finalize_payroll_transfer(db: AsyncSession, tx_ref: str, transaction_i
     elif status in ("failed", "reversed"):
         entry.status = "failed"
         entry.error_msg = f"Transfer {status}: {data.get('complete_message', '')}"[:200]
+        logger.warning("payroll.transfer.failed: ref=%s employee=%r status=%s reason=%s", tx_ref, entry.employee_name, status, data.get("complete_message", "")[:100])
     else:
         return {"status": "no_change"}
 
@@ -196,6 +213,7 @@ async def finalize_payroll_checkout(db: AsyncSession, tx_ref: str, transaction_i
     if flw_status != "successful":
         return {"status": "ignored"}
 
+    logger.info("payroll.checkout.finalize.start: ref=%s", tx_ref)
     # Find the transaction record
     tx_result = await db.execute(select(Transaction).where(Transaction.reference == tx_ref).with_for_update())
     tx = tx_result.scalar_one_or_none()
@@ -265,15 +283,16 @@ async def finalize_payroll_checkout(db: AsyncSession, tx_ref: str, transaction_i
                 bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
                 ref  = "QRK_PR_" + uuid.uuid4().hex[:10].upper()
                 try:
-                    result = await best_payout(tx.user_phone, entry.net_amount, bank, ref)
-                    await settle_fee(tx.user_phone, entry.fee, ref)
+                    logger.info("payroll.checkout.payout.start: run=%s ref=%s employee=%r amount=%.2f", run.id, ref, entry.employee_name, entry.gross_amount)
+                    result = await best_payout(tx.user_phone, entry.gross_amount, bank, ref)
                     entry.status   = "completed"
                     entry.provider = result.get("provider")
                     entry.reference = ref
                     entry.paid_at  = datetime.utcnow()
-                    entry.qreek_fee    = entry.fee
+                    entry.qreek_fee    = 0.0
                     entry.provider_fee = 0.0
                     run.paid_count = (run.paid_count or 0) + 1
+                    logger.info("payroll.checkout.payout.ok: run=%s ref=%s employee=%r provider=%s", run.id, ref, entry.employee_name, result.get("provider"))
 
                     # SMS notification to employee when salary lands
                     try:
@@ -282,13 +301,14 @@ async def finalize_payroll_checkout(db: AsyncSession, tx_ref: str, transaction_i
                         if emp and emp.phone:
                             await send_transfer_sms(
                                 phone=emp.phone,
-                                message=f"Qreek: ₦{entry.net_amount:,.0f} salary for {run.period_label} from {(co.name if co else 'your employer')} has been sent to your bank. Ref: {ref}.",
+                                message=f"Qreek: ₦{entry.gross_amount:,.0f} salary for {run.period_label} from {(co.name if co else 'your employer')} has been sent to your bank. Ref: {ref}.",
                                 reference=ref,
                                 db=sess,
                             )
                     except Exception:
                         pass
                 except Exception as e:
+                    logger.warning("payroll.checkout.payout.fail: run=%s ref=%s employee=%r error=%s", run.id, ref, entry.employee_name, str(e)[:200])
                     entry.status    = "failed"
                     entry.error_msg = str(e)[:200]
                     entry.qreek_fee    = 0.0
@@ -298,16 +318,27 @@ async def finalize_payroll_checkout(db: AsyncSession, tx_ref: str, transaction_i
                 # Record transaction
                 txx = Transaction(
                     user_phone=tx.user_phone, tx_type="payroll",
-                    currency="NGN", amount=entry.net_amount,
-                    ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
-                    qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
-                    net_amount=entry.net_amount, status=entry.status,
+                    currency="NGN", amount=entry.gross_amount,
+                    ngn_amount=entry.gross_amount, gross_amount=entry.gross_amount,
+                    qreek_fee=0.0, provider_fee=0.0,
+                    net_amount=entry.gross_amount, status=entry.status,
                     provider=entry.provider, reference=entry.reference,
                     payment_description=f"Payroll {run.period_label} — {entry.employee_name}",
                 )
                 sess.add(txx)
                 sess.add(entry)
                 await sess.flush()
+
+            # Settle Qreek's fee for the entire run once after all employee payouts.
+            run_fee = run.total_fee or 0
+            if run_fee > 0:
+                fee_ref = "QRK_PRF_" + uuid.uuid4().hex[:8].upper()
+                logger.info("payroll.checkout.fee.settle: run=%s fee_ref=%s amount=%.2f", run.id, fee_ref, run_fee)
+                try:
+                    await settle_fee(tx.user_phone, run_fee, fee_ref)
+                except Exception as fee_err:
+                    # Employees are paid — log and reconcile separately if this fails.
+                    logger.warning("payroll.checkout.fee.settle.fail: run=%s fee_ref=%s error=%s", run.id, fee_ref, str(fee_err)[:200])
 
             if run.failed_count and run.paid_count:
                 run.status = "partial"

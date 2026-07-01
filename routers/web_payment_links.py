@@ -64,6 +64,17 @@ async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float 
     for _ in range(2):
         provider_fee = await query_transaction_fee(checkout_amount)
         checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
+    # Buffer: the fee query returns the local card estimate (~1.4%). Higher-cost
+    # methods (international card 3.8%, USSD) would leave the settlement short.
+    # A 50% uplift with a ₦25 floor scales with the transaction and covers most
+    # domestic variance. Any unspent buffer stays in Qreek's merchant balance.
+    buffer = max(round(provider_fee * 0.5, 2), 25.0)
+    provider_fee = round(provider_fee + buffer, 2)
+    checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
+    logger.info(
+        "payment_link.fee_quote: recipient=%.2f qreek_fee=%.2f provider_fee=%.2f checkout=%.2f",
+        recipient_amount, qreek_fee, provider_fee, checkout_amount,
+    )
     return checkout_amount, qreek_fee, provider_fee
 
 
@@ -491,6 +502,11 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
                     added = round(float(tx.net_amount or tx.ngn_amount or tx.amount or 0), 2)
                     family.balance_ngn = round((family.balance_ngn or 0) + added, 2)
                     family.total_contributed = round((family.total_contributed or 0) + added, 2)
+        logger.info(
+            "payment_link.split_completed: ref=%s subaccount=%s checkout=%.2f recipient=%.2f qreek_fee=%.2f",
+            tx_ref, link.flutterwave_subaccount_id, tx.gross_amount or tx.amount,
+            recipient_amount, tx.qreek_fee or tx.fee,
+        )
         await log_payment_event(
             db,
             event_type="flutterwave.split.completed",
@@ -1202,18 +1218,16 @@ async def pay_link(
 
     subaccounts = None
     if link.flutterwave_subaccount_id:
-        # This override is sent at *checkout creation time* (before payer pays).
-        # "flat" + fee (qreek's 0.25% of recipient) tells FW: main merchant gets exactly
-        # this flat commission on the tx; the subaccount (recipient) gets the rest.
-        # This + the correct split_value=0.0025 on the sub record ensures split at
-        # success gives Qreek fee to our balance, user money to their bank.
-        # (Previously: flat_subaccount + recipient_amount reversed it; main got the 100.)
-        # The override takes precedence over whatever split_value is stored on the sub
-        # (so even links created with old 0.9975 get correct split on payments).
+        # flat_subaccount: Flutterwave guarantees the subaccount receives exactly
+        # recipient_amount regardless of their actual processing fee. Qreek receives
+        # whatever remains in the settlement after the subaccount's share.
+        # Any gap between the estimated and actual Flutterwave fee reduces Qreek's
+        # cut, not the recipient's — the platform absorbs estimation variance,
+        # not the person who was promised a specific amount.
         subaccounts = [{
             "id": link.flutterwave_subaccount_id,
-            "transaction_charge_type": "flat",
-            "transaction_charge": fee,
+            "transaction_charge_type": "flat_subaccount",
+            "transaction_charge": recipient_amount,
         }]
 
     checkout = await initialize_checkout(
@@ -1238,6 +1252,10 @@ async def pay_link(
     )
     checkout_url = checkout.get("data", {}).get("link")
     tx.provider_checkout_url = checkout_url
+    logger.info(
+        "payment_link.checkout_created: ref=%s code=%s recipient=%.2f checkout=%.2f subaccount=%s",
+        ref, code, recipient_amount, checkout_amount, link.flutterwave_subaccount_id,
+    )
     await log_payment_event(db, event_type="flutterwave.checkout.created", reference=ref, status="created", payload={"checkout_url": checkout_url, "flutterwave": checkout.get("data", {})})
     await db.commit()
 

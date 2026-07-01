@@ -17,6 +17,7 @@ Flow:
 5. Analytics: Provides organization-wide spending insights and department-level breakdowns.
 """
 import asyncio, csv, io, uuid, re
+import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse
@@ -38,6 +39,7 @@ from services.sms_service import send_sms as send_payout_sms
 router = APIRouter(prefix="/api/v1/payroll", tags=["payroll"])
 
 FEE_PCT = 0.002    # 0.2% per direct payroll payment
+logger = logging.getLogger(__name__)
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -808,17 +810,21 @@ async def create_run(
 
     for emp in emps:
         gross = float(overrides.get(emp.id, emp.salary))
-        fee   = round(gross * FEE_PCT, 2)
-        net   = round(gross - fee, 2)
         total_gross += gross
         entry_data.append({
             "employee_id": emp.id, "employee_name": emp.name,
             "bank_account": emp.bank_account, "bank_code": emp.bank_code, "bank_name": emp.bank_name,
-            "gross_amount": gross, "fee": fee, "net_amount": net,
+            "gross_amount": gross, "fee": 0.0, "net_amount": gross,
         })
 
-    total_fee = round(sum(ed["fee"] for ed in entry_data), 2)
-    total_net = round(total_gross - total_fee, 2)
+    # Fee is charged once on the total to the employer, not deducted from each employee.
+    # Employees receive their exact stated salary; the 0.2% is a cost to the business.
+    total_fee = round(total_gross * FEE_PCT, 2)
+    total_net = total_gross
+    logger.info(
+        "payroll.run.preview: company=%s period=%r employees=%d gross=%.2f fee=%.2f",
+        co.id, body.period_label, len(emps), total_gross, total_fee,
+    )
 
     # Create the run in PENDING state
     run = PayrollRun(
@@ -910,7 +916,12 @@ async def execute_run(
             raise HTTPException(status_code=403, detail="Account frozen after 5 failed PIN attempts.")
         raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
 
-    await debit_company_wallet_or_reject(db, co.id, run.total_gross)
+    total_to_debit = round((run.total_gross or 0) + (run.total_fee or 0), 2)
+    logger.info(
+        "payroll.run.execute: run=%s company=%s period=%r entry_count=%d gross=%.2f fee=%.2f debit=%.2f",
+        run.id, co.id, run.period_label, run.entry_count or 0, run.total_gross or 0, run.total_fee or 0, total_to_debit,
+    )
+    await debit_company_wallet_or_reject(db, co.id, total_to_debit)
 
     # Mark as processing
     run.status = "processing"
@@ -932,15 +943,16 @@ async def execute_run(
                 bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
                 ref  = "QRK_PR_" + uuid.uuid4().hex[:10].upper()
                 try:
-                    result = await best_payout(phone, entry.net_amount, bank, ref)
-                    await settle_fee(phone, entry.fee, ref)
+                    logger.info("payroll.payout.start: run=%s ref=%s employee=%r amount=%.2f", run.id, ref, entry.employee_name, entry.gross_amount)
+                    result = await best_payout(phone, entry.gross_amount, bank, ref)
                     entry.status   = "completed"
                     entry.provider = result.get("provider")
                     entry.reference = ref
                     entry.paid_at  = datetime.utcnow()
-                    entry.qreek_fee    = entry.fee
+                    entry.qreek_fee    = 0.0
                     entry.provider_fee = 0.0
                     run.paid_count = (run.paid_count or 0) + 1
+                    logger.info("payroll.payout.ok: run=%s ref=%s employee=%r provider=%s", run.id, ref, entry.employee_name, result.get("provider"))
 
                     # SMS notification to employee when salary lands
                     try:
@@ -949,13 +961,14 @@ async def execute_run(
                         if emp and emp.phone:
                             await send_payout_sms(
                                 phone=emp.phone,
-                                message=f"Qreek: ₦{entry.net_amount:,.0f} salary for {run.period_label} from {co.name} has been sent to your bank. Ref: {ref}.",
+                                message=f"Qreek: ₦{entry.gross_amount:,.0f} salary for {run.period_label} from {co.name} has been sent to your bank. Ref: {ref}.",
                                 reference=ref,
                                 db=sess,
                             )
                     except Exception:
                         pass
                 except Exception as e:
+                    logger.warning("payroll.payout.fail: run=%s ref=%s employee=%r error=%s", run.id, ref, entry.employee_name, str(e)[:200])
                     entry.status    = "failed"
                     entry.error_msg = str(e)[:200]
                     entry.qreek_fee    = 0.0
@@ -966,16 +979,26 @@ async def execute_run(
                 # Record transaction
                 tx = Transaction(
                     user_phone=phone, tx_type="payroll",
-                    currency="NGN", amount=entry.net_amount,
-                    ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
-                    qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
-                    net_amount=entry.net_amount, status=entry.status,
+                    currency="NGN", amount=entry.gross_amount,
+                    ngn_amount=entry.gross_amount, gross_amount=entry.gross_amount,
+                    qreek_fee=0.0, provider_fee=0.0,
+                    net_amount=entry.gross_amount, status=entry.status,
                     provider=entry.provider, reference=entry.reference,
                     payment_description=f"Payroll {run.period_label} — {entry.employee_name}",
                 )
                 sess.add(tx)
                 sess.add(entry)
                 await sess.flush()
+
+            # Settle Qreek's fee for the entire run once after all employee payouts.
+            run_fee = run.total_fee or 0
+            if run_fee > 0:
+                fee_ref = "QRK_PRF_" + uuid.uuid4().hex[:8].upper()
+                logger.info("payroll.fee.settle: run=%s fee_ref=%s amount=%.2f", run.id, fee_ref, run_fee)
+                try:
+                    await settle_fee(phone, run_fee, fee_ref)
+                except Exception as fee_exc:
+                    logger.warning("payroll.fee.settle.fail: run=%s fee_ref=%s error=%s", run.id, fee_ref, str(fee_exc)[:200])
 
             if run.failed_count and run.paid_count:
                 run.status = "partial"
@@ -1058,19 +1081,21 @@ async def retry_entry(
 
     bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
     ref  = "QRK_PR_RETRY_" + uuid.uuid4().hex[:10].upper()
+    logger.info("payroll.entry.retry: run=%s entry=%s employee=%r amount=%.2f ref=%s", run_id, entry_id, entry.employee_name, entry.gross_amount, ref)
     try:
-        result = await best_payout(phone, entry.net_amount, bank, ref)
-        await settle_fee(phone, entry.fee, ref)
+        result = await best_payout(phone, entry.gross_amount, bank, ref)
         entry.status    = "completed"
         entry.provider  = result.get("provider")
         entry.reference = ref
         entry.error_msg = None
         entry.paid_at   = datetime.utcnow()
-        entry.qreek_fee    = entry.fee
+        entry.qreek_fee    = 0.0
         entry.provider_fee = 0.0
         run.paid_count  = (run.paid_count or 0) + 1
         run.failed_count = max(0, (run.failed_count or 1) - 1)
+        logger.info("payroll.entry.retry.ok: ref=%s employee=%r provider=%s", ref, entry.employee_name, entry.provider)
     except Exception as e:
+        logger.warning("payroll.entry.retry.fail: ref=%s employee=%r error=%s", ref, entry.employee_name, str(e)[:200])
         entry.status    = "failed"
         entry.error_msg = str(e)[:200]
         await refund_company_wallet(db, co.id, entry.gross_amount)
@@ -1080,10 +1105,10 @@ async def retry_entry(
     # Record transaction
     tx = Transaction(
         user_phone=phone, tx_type="payroll_retry",
-        currency="NGN", amount=entry.net_amount,
-        ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
-        qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
-        net_amount=entry.net_amount, status=entry.status,
+        currency="NGN", amount=entry.gross_amount,
+        ngn_amount=entry.gross_amount, gross_amount=entry.gross_amount,
+        qreek_fee=0.0, provider_fee=0.0,
+        net_amount=entry.gross_amount, status=entry.status,
         provider=entry.provider, reference=entry.reference,
         payment_description=f"Payroll retry {run.period_label} — {entry.employee_name}",
     )
@@ -1106,7 +1131,7 @@ async def retry_entry(
         if emp and emp.phone:
             await send_payout_sms(
                 phone=emp.phone,
-                message=f"Qreek: ₦{entry.net_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
+                message=f"Qreek: ₦{entry.gross_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
                 reference=ref,
                 db=db,
             )
@@ -1139,29 +1164,29 @@ async def retry_all_failed(
     if not failed:
         raise HTTPException(status_code=400, detail="No failed entries to retry.")
 
+    logger.info("payroll.bulk_retry.start: run=%s count=%d company=%s", run_id, len(failed), co.id)
     results = {"success": 0, "failed": 0, "details": []}
     for entry in failed:
         try:
             await debit_company_wallet_or_reject(db, co.id, entry.gross_amount)
             bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
             ref  = "QRK_PR_RETRY_" + uuid.uuid4().hex[:10].upper()
-            result = await best_payout(phone, entry.net_amount, bank, ref)
-            await settle_fee(phone, entry.fee, ref)
+            result = await best_payout(phone, entry.gross_amount, bank, ref)
             entry.status    = "completed"
             entry.provider  = result.get("provider")
             entry.reference = ref
             entry.error_msg = None
             entry.paid_at   = datetime.utcnow()
-            entry.qreek_fee    = entry.fee
+            entry.qreek_fee    = 0.0
             entry.provider_fee = 0.0
             run.paid_count  = (run.paid_count or 0) + 1
             run.failed_count = max(0, (run.failed_count or 1) - 1)
             tx = Transaction(
                 user_phone=phone, tx_type="payroll_retry",
-                currency="NGN", amount=entry.net_amount,
-                ngn_amount=entry.net_amount, gross_amount=entry.gross_amount,
-                qreek_fee=entry.qreek_fee, provider_fee=entry.provider_fee,
-                net_amount=entry.net_amount, status=entry.status,
+                currency="NGN", amount=entry.gross_amount,
+                ngn_amount=entry.gross_amount, gross_amount=entry.gross_amount,
+                qreek_fee=0.0, provider_fee=0.0,
+                net_amount=entry.gross_amount, status=entry.status,
                 provider=entry.provider, reference=entry.reference,
                 payment_description=f"Payroll retry {run.period_label} — {entry.employee_name}",
             )
@@ -1176,13 +1201,14 @@ async def retry_all_failed(
                 if emp and emp.phone:
                     await send_payout_sms(
                         phone=emp.phone,
-                        message=f"Qreek: ₦{entry.net_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
+                        message=f"Qreek: ₦{entry.gross_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
                         reference=ref,
                         db=db,
                     )
             except Exception:
                 pass
         except Exception as e:
+            logger.warning("payroll.bulk_retry.entry_fail: run=%s employee=%r error=%s", run_id, entry.employee_name, str(e)[:200])
             results["failed"] += 1
             entry.error_msg = str(e)[:200]
             try:
@@ -1192,6 +1218,7 @@ async def retry_all_failed(
             results["details"].append({"employee": entry.employee_name, "status": "failed", "error": str(e)[:100]})
         db.add(entry)
 
+    logger.info("payroll.bulk_retry.done: run=%s success=%d failed=%d", run_id, results["success"], results["failed"])
     if run.failed_count == 0:
         run.status = "completed"
     elif run.paid_count > 0:
@@ -1290,11 +1317,32 @@ async def create_payroll_checkout(
     if not ok:
         raise HTTPException(status_code=401, detail="Incorrect payroll transaction PIN.")
 
+    from services.flutterwave_service import initialize_checkout, query_transaction_fee
+
+    # Gross-up: employer pays total salaries + Qreek fee + Flutterwave processing fee.
+    # Two iterations converge the estimate because the provider fee is a function of
+    # the checkout total, which itself changes as the fee is added.
+    qreek_fee = run.total_fee or 0
+    checkout_base = round(run.total_gross + qreek_fee, 2)
+    provider_fee = 0.0
+    for _ in range(2):
+        provider_fee = await query_transaction_fee(checkout_base)
+        checkout_base = round(run.total_gross + qreek_fee + provider_fee, 2)
+    # Same buffer as payment links: 50% uplift on estimated provider fee,
+    # floor of ₦25. Unspent buffer stays in Qreek's Flutterwave merchant balance.
+    buffer = max(round(provider_fee * 0.5, 2), 25.0)
+    provider_fee = round(provider_fee + buffer, 2)
+    checkout_amount = round(run.total_gross + qreek_fee + provider_fee, 2)
+    logger.info(
+        "payroll.checkout.quote: run=%s gross=%.2f qreek_fee=%.2f provider_fee=%.2f checkout=%.2f",
+        run_id, run.total_gross, qreek_fee, provider_fee, checkout_amount,
+    )
+
     ref = "QRK_PRCK_" + uuid.uuid4().hex[:10].upper()
     tx  = Transaction(
         user_phone=phone, tx_type="payroll_payment",
-        currency="NGN", amount=run.total_gross, ngn_amount=run.total_gross,
-        gross_amount=run.total_gross, qreek_fee=0.0, provider_fee=0.0,
+        currency="NGN", amount=checkout_amount, ngn_amount=run.total_gross,
+        gross_amount=checkout_amount, qreek_fee=qreek_fee, provider_fee=provider_fee,
         net_amount=run.total_gross, status="pending", reference=ref,
         payment_description=f"Payroll {run.period_label} — {co.name}",
     )
@@ -1302,14 +1350,12 @@ async def create_payroll_checkout(
     db.add(tx)
     await db.flush()
 
-    from services.flutterwave_service import initialize_checkout
-
     checkout = await initialize_checkout(
-        tx_ref=ref, amount=run.total_gross,
+        tx_ref=ref, amount=checkout_amount,
         customer_name=co.name, customer_phone=phone,
         redirect_url=None,
         title=f"Payroll — {run.period_label}",
-        description=f"Pay ₦{run.total_gross:,.2f} for {run.entry_count} employees — {co.name}",
+        description=f"₦{run.total_gross:,.2f} salaries + ₦{qreek_fee:,.2f} Qreek fee + ₦{provider_fee:,.2f} processing fee — {co.name}",
         metadata={"company_id": co.id, "run_id": run.id, "tx_ref": ref},
     )
 
