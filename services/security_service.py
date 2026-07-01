@@ -1,7 +1,7 @@
 from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from database.models import UserSecurity
+from database.models import UserSecurity, Company
 
 pwd_ctx = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 MAX_PIN_ATTEMPTS = 5
@@ -99,3 +99,28 @@ async def unfreeze_account(db: AsyncSession, phone: str):
         sec.account_frozen   = False
         sec.failed_pin_count = 0
         await db.commit()
+
+
+async def set_company_payment_pin(db: AsyncSession, company_id: str, pin: str):
+    """
+    Sets or updates the payment/transaction PIN for a company.
+    Hashes the PIN before storing it in the database.
+    """
+    result = await db.execute(select(Company).where(Company.id == company_id))
+    co = result.scalar_one_or_none()
+    if not co:
+        return
+    co.payment_pin_hash = pwd_ctx.hash(pin)
+    await db.commit()
+
+
+async def verify_company_payment_pin(db: AsyncSession, company_id: str, pin: str) -> bool:
+    """
+    Verifies the provided PIN against the company's payment PIN hash.
+    Returns True if the PIN is correct, False otherwise.
+    """
+    result = await db.execute(select(Company).where(Company.id == company_id))
+    co = result.scalar_one_or_none()
+    if not co or not co.payment_pin_hash:
+        return False
+    return pwd_ctx.verify(pin, co.payment_pin_hash)

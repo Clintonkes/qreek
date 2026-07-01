@@ -29,7 +29,7 @@ from database.session import get_db
 from database.models import Company, Employee, PayrollRun, PayrollEntry, AuditLog, User, Transaction
 from core.web_jwt import decode_token
 from core.banks import resolve_bank, BANKS
-from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin
+from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin, verify_company_payment_pin, set_company_payment_pin
 from services.payment_service import debit_ngn_or_reject, refund_ngn, debit_company_wallet_or_reject, refund_company_wallet
 from core.payout import best_payout, settle_fee
 from services.flutterwave_service import resolve_account
@@ -1281,23 +1281,14 @@ async def create_payroll_checkout(
     if (run.total_gross or 0) <= 0:
         raise HTTPException(status_code=400, detail="Payroll total must be greater than zero.")
 
-    # Check user has a PIN before verifying
-    from database.models import UserSecurity
-    sec_r = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
-    sec = sec_r.scalar_one_or_none()
-    if not sec or not sec.pin_hash:
-        raise HTTPException(status_code=400, detail="You haven't set a transaction PIN yet. Set one in Settings first.")
+    # Check company has a payment PIN before verifying
+    if not co.payment_pin_hash:
+        raise HTTPException(status_code=400, detail="You haven't set a payroll transaction PIN yet. Set one in Settings first.")
 
-    # Verify PIN before allowing checkout
-    if await is_frozen(db, phone):
-        raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
-
-    ok = await verify_transaction_pin(db, phone, body.pin)
+    # Verify payment PIN before allowing checkout
+    ok = await verify_company_payment_pin(db, co.id, body.pin)
     if not ok:
-        remaining = await pin_attempts_remaining(db, phone)
-        if remaining <= 0:
-            raise HTTPException(status_code=403, detail="Account frozen after 5 failed PIN attempts.")
-        raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
+        raise HTTPException(status_code=401, detail="Incorrect payroll transaction PIN.")
 
     ref = "QRK_PRCK_" + uuid.uuid4().hex[:10].upper()
     tx  = Transaction(
@@ -1337,13 +1328,36 @@ async def create_payroll_checkout(
     }
 
 
-@router.get("/wallet/balance")
-async def get_wallet_balance(claims: dict = Depends(decode_token), db: AsyncSession = Depends(get_db), company_id: Optional[str] = Header(None, alias="x-company-id"),
+class SetPaymentPinIn(BaseModel):
+    pin: str
+
+
+@router.post("/company/set-payment-pin")
+async def set_company_payment_pin_endpoint(
+    body: SetPaymentPinIn,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
-    """Get the company wallet balance."""
+    """Set or change the company's payroll transaction PIN (separate from login PIN)."""
     phone = claims["phone"]
     co    = await _get_company(db, phone, company_id)
-    return {"wallet_balance_ngn": co.wallet_balance_ngn or 0}
+    if not re.match(r"^\d{4,6}$", body.pin):
+        raise HTTPException(status_code=400, detail="PIN must be 4–6 digits")
+    await set_company_payment_pin(db, co.id, body.pin)
+    return {"message": "Payroll transaction PIN set successfully"}
+
+
+@router.get("/company/has-payment-pin")
+async def has_company_payment_pin(
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
+):
+    """Check if the company has a payroll transaction PIN set."""
+    phone = claims["phone"]
+    co    = await _get_company(db, phone, company_id)
+    return {"has_payment_pin": bool(co.payment_pin_hash)}
 
 
 # ── CSV Export ────────────────────────────────────────────────────────────────
