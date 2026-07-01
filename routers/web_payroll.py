@@ -1315,7 +1315,7 @@ async def create_payroll_checkout(
     # Verify payment PIN before allowing checkout
     ok = await verify_company_payment_pin(db, co.id, body.pin)
     if not ok:
-        raise HTTPException(status_code=401, detail="Incorrect payroll transaction PIN.")
+        raise HTTPException(status_code=403, detail="Incorrect payroll transaction PIN.")
 
     from services.flutterwave_service import initialize_checkout, query_transaction_fee
 
