@@ -3,6 +3,8 @@
 .env.*
 !.env.example
 .env.example
+qreek.dump
+
 
 # Python
 __pycache__/
