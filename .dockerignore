@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.dump
+node_modules
+dist
+.env
+.env.*
+qreek.dump
