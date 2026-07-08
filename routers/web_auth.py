@@ -27,9 +27,11 @@ from core.web_jwt import decode_token, issue_session_tokens, refresh_session_tok
 from core.banks import BANKS, resolve_bank
 from core.session import set_state, State
 import redis.asyncio as aioredis
+import logging
 import os, re
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 _redis = None
@@ -44,6 +46,25 @@ async def _r():
     if not _redis:
         _redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
     return _redis
+
+
+async def _redis_call(method: str, *args, default=None, required: bool = False):
+    """
+    Executes Redis operations without turning cache outages into 500s for auth.
+    """
+    r = await _r()
+    if not r:
+        if required:
+            raise HTTPException(status_code=503, detail="Authentication cache is temporarily unavailable. Please try again.")
+        return default
+
+    try:
+        return await getattr(r, method)(*args)
+    except Exception as exc:
+        logger.warning("Redis %s failed in auth flow: %s", method, exc)
+        if required:
+            raise HTTPException(status_code=503, detail="Authentication cache is temporarily unavailable. Please try again.")
+        return default
 
 
 def normalise_phone(phone: str) -> str:
@@ -166,19 +187,21 @@ async def login(body: LoginBody, request: Request, db: AsyncSession = Depends(ge
     if await is_frozen(db, phone):
         raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
 
-    r        = await _r()
     fail_key = f"web_pin_fail:{phone}"
     ok       = await verify_pin(db, phone, body.pin)
 
     if not ok:
-        fails = await r.incr(fail_key)
-        await r.expire(fail_key, 3600)
-        if int(fails) >= 5:
-            await freeze_account(db, phone)
-            raise HTTPException(status_code=403, detail="Account frozen after 5 failed attempts.")
-        raise HTTPException(status_code=401, detail=f"Incorrect PIN. {5 - int(fails)} attempts remaining.")
+        fails = await _redis_call("incr", fail_key)
+        if fails is not None:
+            await _redis_call("expire", fail_key, 3600)
+            remaining = max(0, 5 - int(fails))
+            if remaining == 0:
+                await freeze_account(db, phone)
+                raise HTTPException(status_code=403, detail="Account frozen after 5 failed attempts.")
+            raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
+        raise HTTPException(status_code=401, detail="Incorrect PIN. Please try again.")
 
-    await r.delete(fail_key)
+    await _redis_call("delete", fail_key)
     tokens = await issue_session_tokens(db, phone, request)
     await db.commit()
     return {**tokens, "user": user_to_dict(user)}
@@ -332,8 +355,7 @@ async def forgot_pin(body: ForgotPinBody, db: AsyncSession = Depends(get_db)):
         return {"message": "If an account with that number exists, an OTP has been sent."}
 
     otp = "".join(random.choices(string.digits, k=6))
-    r   = await _r()
-    await r.setex(f"otp:{phone}", 600, otp)
+    await _redis_call("setex", f"otp:{phone}", 600, otp, required=True)
 
     import os
     if os.getenv("ENVIRONMENT", "production") == "development":
@@ -350,13 +372,12 @@ async def verify_otp(body: VerifyOtpBody, db: AsyncSession = Depends(get_db)):
     If valid, generates a temporary reset token and stores it in Redis.
     """
     phone  = normalise_phone(body.phone)
-    r      = await _r()
-    stored = await r.get(f"otp:{phone}")
+    stored = await _redis_call("get", f"otp:{phone}", required=True)
     if not stored or stored != body.otp.strip():
         raise HTTPException(status_code=400, detail="Invalid or expired OTP. Request a new one.")
-    await r.delete(f"otp:{phone}")
+    await _redis_call("delete", f"otp:{phone}", required=True)
     reset_token = "".join(random.choices(string.ascii_letters + string.digits, k=40))
-    await r.setex(f"reset_token:{phone}", 300, reset_token)
+    await _redis_call("setex", f"reset_token:{phone}", 300, reset_token, required=True)
     return {"reset_token": reset_token, "message": "OTP verified. Set your new PIN within 5 minutes."}
 
 
@@ -367,8 +388,7 @@ async def reset_pin(body: ResetPinBody, db: AsyncSession = Depends(get_db)):
     Unfreezes the account and clears failed attempt counters upon success.
     """
     phone        = normalise_phone(body.phone)
-    r            = await _r()
-    stored_token = await r.get(f"reset_token:{phone}")
+    stored_token = await _redis_call("get", f"reset_token:{phone}", required=True)
     if not stored_token or stored_token != body.reset_token:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token. Start over.")
     if not re.match(r"^\d{4,6}$", body.new_pin):
@@ -380,7 +400,7 @@ async def reset_pin(body: ResetPinBody, db: AsyncSession = Depends(get_db)):
     await set_pin(db, phone, body.new_pin)
     from services.security_service import unfreeze_account
     await unfreeze_account(db, phone)
-    await r.delete(f"reset_token:{phone}")
-    await r.delete(f"web_pin_fail:{phone}")
+    await _redis_call("delete", f"reset_token:{phone}", required=True)
+    await _redis_call("delete", f"web_pin_fail:{phone}")
     return {"message": "PIN reset successfully. You can now sign in."}
 
