@@ -22,7 +22,14 @@ from pydantic import BaseModel
 from database.session import get_db
 from database.models import User, UserSecurity
 from services.user_service import get_or_create_user, save_bank, apply_referral
-from services.security_service import set_pin, verify_pin, freeze_account, is_frozen
+from services.security_service import (
+    set_pin,
+    verify_pin,
+    freeze_account,
+    is_frozen,
+    verify_transaction_pin,
+    pin_attempts_remaining,
+)
 from core.web_jwt import decode_token, issue_session_tokens, refresh_session_tokens, revoke_all_sessions, revoke_session
 from core.banks import BANKS, resolve_bank
 from core.session import set_state, State
@@ -187,21 +194,15 @@ async def login(body: LoginBody, request: Request, db: AsyncSession = Depends(ge
     if await is_frozen(db, phone):
         raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
 
-    fail_key = f"web_pin_fail:{phone}"
-    ok       = await verify_pin(db, phone, body.pin)
-
+    ok = await verify_transaction_pin(db, phone, body.pin)
     if not ok:
-        fails = await _redis_call("incr", fail_key)
-        if fails is not None:
-            await _redis_call("expire", fail_key, 3600)
-            remaining = max(0, 5 - int(fails))
-            if remaining == 0:
-                await freeze_account(db, phone)
-                raise HTTPException(status_code=403, detail="Account frozen after 5 failed attempts.")
+        if await is_frozen(db, phone):
+            raise HTTPException(status_code=403, detail="Account frozen after 5 failed attempts.")
+        remaining = await pin_attempts_remaining(db, phone)
+        if remaining > 0:
             raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
         raise HTTPException(status_code=401, detail="Incorrect PIN. Please try again.")
 
-    await _redis_call("delete", fail_key)
     tokens = await issue_session_tokens(db, phone, request)
     await db.commit()
     return {**tokens, "user": user_to_dict(user)}

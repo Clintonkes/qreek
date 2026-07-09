@@ -16,18 +16,18 @@ Flow:
    updates (pending -> processing -> completed/failed).
 5. Analytics: Provides organization-wide spending insights and department-level breakdowns.
 """
-import asyncio, csv, io, uuid, re
+import asyncio, csv, io, uuid, re, os
 import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func
+from sqlalchemy import select, desc, func, or_
 from pydantic import BaseModel
 from typing import Optional, List
 
 from database.session import get_db
-from database.models import Company, Employee, PayrollRun, PayrollEntry, AuditLog, User, Transaction
+from database.models import Company, Employee, PayrollRun, PayrollEntry, AuditLog, User, Transaction, PaymentEvent
 from core.web_jwt import decode_token
 from core.banks import resolve_bank, BANKS
 from services.security_service import is_frozen, pin_attempts_remaining, verify_transaction_pin, verify_company_payment_pin, set_company_payment_pin
@@ -35,6 +35,7 @@ from services.payment_service import debit_ngn_or_reject, refund_ngn, debit_comp
 from core.payout import best_payout, settle_fee
 from services.flutterwave_service import resolve_account
 from services.sms_service import send_sms as send_payout_sms
+from routers.web_flutterwave import finalize_payroll_checkout
 
 router = APIRouter(prefix="/api/v1/payroll", tags=["payroll"])
 
@@ -105,6 +106,12 @@ class PayrollCheckoutIn(BaseModel):
     pin: str
 
 
+class PayrollCheckoutConfirmIn(BaseModel):
+    tx_ref: str
+    transaction_id: str | int
+    status: str | None = None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _co_dict(c: Company) -> dict:
@@ -166,6 +173,18 @@ def _entry_dict(e: PayrollEntry) -> dict:
         "error_msg": e.error_msg,
         "paid_at": e.paid_at.isoformat() if e.paid_at else None,
     }
+
+
+def _provider_transaction_id(result: dict | None) -> str | None:
+    """
+    Extracts a provider-side transfer identifier from payout API responses.
+    Supports both Flutterwave-style nested payloads and direct response ids.
+    """
+    if not isinstance(result, dict):
+        return None
+    data = result.get("data") or {}
+    value = data.get("id") or data.get("transfer_id") or result.get("id")
+    return str(value) if value is not None else None
 
 
 async def _get_company(db: AsyncSession, phone: str, company_id: str = None) -> Company:
@@ -885,6 +904,121 @@ async def get_run(
     return {"run": _run_dict(run), "entries": [_entry_dict(e) for e in entries]}
 
 
+@router.get("/debug/events/{reference}")
+async def get_payroll_events(
+    reference: str,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
+):
+    """
+    Returns payroll events, transactions, and entry state for a run ID or transfer reference.
+    This is intended for live debugging and reconciliation.
+    """
+    phone = claims["phone"]
+    co = await _get_company(db, phone, company_id)
+    ref = reference.strip()
+
+    run = None
+    run_result = await db.execute(select(PayrollRun).where(PayrollRun.id == ref, PayrollRun.company_id == co.id))
+    run = run_result.scalar_one_or_none()
+
+    entry_refs = {ref}
+    if run:
+        er = await db.execute(select(PayrollEntry).where(PayrollEntry.run_id == run.id).order_by(PayrollEntry.employee_name))
+        entries = er.scalars().all()
+        for entry in entries:
+            for value in (entry.reference, entry.tx_ref, entry.payout_reference, entry.provider_transaction_id):
+                if value:
+                    entry_refs.add(str(value))
+    else:
+        er = await db.execute(
+            select(PayrollEntry)
+            .join(PayrollRun, PayrollEntry.run_id == PayrollRun.id)
+            .where(
+                PayrollRun.company_id == co.id,
+                or_(
+                    PayrollEntry.reference == ref,
+                    PayrollEntry.tx_ref == ref,
+                    PayrollEntry.payout_reference == ref,
+                    PayrollEntry.provider_transaction_id == ref,
+                ),
+            )
+        )
+        entries = er.scalars().all()
+        for entry in entries:
+            for value in (entry.reference, entry.tx_ref, entry.payout_reference, entry.provider_transaction_id):
+                if value:
+                    entry_refs.add(str(value))
+
+    tx_result = await db.execute(
+        select(Transaction).where(
+            or_(
+                Transaction.user_phone == phone,
+                Transaction.reference.in_(list(entry_refs)),
+                Transaction.tx_ref.in_(list(entry_refs)),
+                Transaction.payout_reference.in_(list(entry_refs)),
+                Transaction.provider_transaction_id.in_(list(entry_refs)),
+            )
+        ).order_by(desc(Transaction.created_at))
+    )
+    txs = tx_result.scalars().all()
+
+    evt_result = await db.execute(
+        select(PaymentEvent).where(
+            or_(
+                PaymentEvent.reference.in_(list(entry_refs)),
+                PaymentEvent.transaction_id.in_(list(entry_refs)),
+            )
+        ).order_by(desc(PaymentEvent.created_at))
+    )
+    events = evt_result.scalars().all()
+
+    return {
+        "reference": ref,
+        "company": _co_dict(co),
+        "run": _run_dict(run) if run else None,
+        "entries": [
+            {
+                **_entry_dict(entry),
+                "payout_status": entry.payout_status,
+                "payout_reference": entry.payout_reference,
+                "provider_transaction_id": entry.provider_transaction_id,
+            }
+            for entry in entries
+        ],
+        "transactions": [
+            {
+                "id": tx.id,
+                "reference": tx.reference,
+                "tx_ref": tx.tx_ref,
+                "status": tx.status,
+                "payout_status": tx.payout_status,
+                "payout_reference": tx.payout_reference,
+                "provider_transaction_id": tx.provider_transaction_id,
+                "amount": tx.amount,
+                "gross_amount": tx.gross_amount,
+                "net_amount": tx.net_amount,
+                "created_at": tx.created_at.isoformat() if tx.created_at else None,
+                "payment_description": tx.payment_description,
+            }
+            for tx in txs
+        ],
+        "events": [
+            {
+                "event_type": evt.event_type,
+                "status": evt.status,
+                "reference": evt.reference,
+                "transaction_id": evt.transaction_id,
+                "message": evt.message,
+                "payload": evt.payload,
+                "created_at": evt.created_at.isoformat() if evt.created_at else None,
+            }
+            for evt in events
+        ],
+    }
+
+
 @router.post("/runs/{run_id}/execute")
 async def execute_run(
     run_id: str,
@@ -945,13 +1079,17 @@ async def execute_run(
                 try:
                     logger.info("payroll.payout.start: run=%s ref=%s employee=%r amount=%.2f", run.id, ref, entry.employee_name, entry.gross_amount)
                     result = await best_payout(phone, entry.gross_amount, bank, ref)
-                    entry.status   = "completed"
+                    provider_tx_id = _provider_transaction_id(result)
+                    entry.status   = "processing"
                     entry.provider = result.get("provider")
                     entry.reference = ref
+                    entry.provider_transaction_id = str(provider_tx_id) if provider_tx_id else None
+                    entry.payout_status = "submitted"
+                    entry.payout_reference = ref
+                    entry.payout_error = None
                     entry.paid_at  = datetime.utcnow()
                     entry.qreek_fee    = 0.0
                     entry.provider_fee = 0.0
-                    run.paid_count = (run.paid_count or 0) + 1
                     logger.info("payroll.payout.ok: run=%s ref=%s employee=%r provider=%s", run.id, ref, entry.employee_name, result.get("provider"))
 
                     # SMS notification to employee when salary lands
@@ -970,6 +1108,9 @@ async def execute_run(
                 except Exception as e:
                     logger.warning("payroll.payout.fail: run=%s ref=%s employee=%r error=%s", run.id, ref, entry.employee_name, str(e)[:200])
                     entry.status    = "failed"
+                    entry.payout_status = "failed"
+                    entry.payout_reference = ref
+                    entry.payout_error = str(e)[:500]
                     entry.error_msg = str(e)[:200]
                     entry.qreek_fee    = 0.0
                     entry.provider_fee = 0.0
@@ -984,6 +1125,8 @@ async def execute_run(
                     qreek_fee=0.0, provider_fee=0.0,
                     net_amount=entry.gross_amount, status=entry.status,
                     provider=entry.provider, reference=entry.reference,
+                    payout_status=entry.payout_status, payout_reference=entry.payout_reference, payout_error=entry.payout_error,
+                    provider_transaction_id=entry.provider_transaction_id,
                     payment_description=f"Payroll {run.period_label} — {entry.employee_name}",
                 )
                 sess.add(tx)
@@ -1000,13 +1143,17 @@ async def execute_run(
                 except Exception as fee_exc:
                     logger.warning("payroll.fee.settle.fail: run=%s fee_ref=%s error=%s", run.id, fee_ref, str(fee_exc)[:200])
 
-            if run.failed_count and run.paid_count:
-                run.status = "partial"
-            elif run.failed_count == run.entry_count:
-                run.status = "failed"
+            any_processing = any(getattr(e, "status", None) == "processing" for e in entries)
+            any_failed = any(getattr(e, "status", None) == "failed" for e in entries)
+            if any_processing:
+                run.status = "processing"
+                run.completed_at = None
+            elif any_failed and not any_processing:
+                run.status = "failed" if all(getattr(e, "status", None) == "failed" for e in entries) else "partial"
+                run.completed_at = datetime.utcnow()
             else:
                 run.status = "completed"
-            run.completed_at = datetime.utcnow()
+                run.completed_at = datetime.utcnow()
 
             co_r = await sess.execute(select(Company).where(Company.id == co.id))
             co2  = co_r.scalar_one_or_none()
@@ -1084,20 +1231,27 @@ async def retry_entry(
     logger.info("payroll.entry.retry: run=%s entry=%s employee=%r amount=%.2f ref=%s", run_id, entry_id, entry.employee_name, entry.gross_amount, ref)
     try:
         result = await best_payout(phone, entry.gross_amount, bank, ref)
-        entry.status    = "completed"
+        provider_tx_id = _provider_transaction_id(result)
+        entry.status    = "processing"
         entry.provider  = result.get("provider")
         entry.reference = ref
+        entry.provider_transaction_id = provider_tx_id
+        entry.payout_status = "submitted"
+        entry.payout_reference = ref
+        entry.payout_error = None
         entry.error_msg = None
         entry.paid_at   = datetime.utcnow()
         entry.qreek_fee    = 0.0
         entry.provider_fee = 0.0
-        run.paid_count  = (run.paid_count or 0) + 1
         run.failed_count = max(0, (run.failed_count or 1) - 1)
         logger.info("payroll.entry.retry.ok: ref=%s employee=%r provider=%s", ref, entry.employee_name, entry.provider)
     except Exception as e:
         logger.warning("payroll.entry.retry.fail: ref=%s employee=%r error=%s", ref, entry.employee_name, str(e)[:200])
         entry.status    = "failed"
         entry.error_msg = str(e)[:200]
+        entry.payout_status = "failed"
+        entry.payout_reference = ref
+        entry.payout_error = str(e)[:500]
         await refund_company_wallet(db, co.id, entry.gross_amount)
         await db.commit()
         raise HTTPException(status_code=502, detail=f"Retry failed: {e}")
@@ -1114,13 +1268,9 @@ async def retry_entry(
     )
     db.add(tx)
 
-    # Recalculate run status
-    if run.failed_count == 0:
-        run.status = "completed"
-    elif run.failed_count > 0 and run.paid_count > 0:
-        run.status = "partial"
-    else:
-        run.status = "failed"
+    # Keep the run open until the transfer webhook confirms settlement.
+    run.status = "processing"
+    run.completed_at = None
 
     await db.commit()
 
@@ -1170,16 +1320,20 @@ async def retry_all_failed(
         try:
             await debit_company_wallet_or_reject(db, co.id, entry.gross_amount)
             bank = {"account_number": entry.bank_account, "bank_code": entry.bank_code}
-            ref  = "QRK_PR_RETRY_" + uuid.uuid4().hex[:10].upper()
+            ref = "QRK_PR_RETRY_" + uuid.uuid4().hex[:10].upper()
             result = await best_payout(phone, entry.gross_amount, bank, ref)
-            entry.status    = "completed"
-            entry.provider  = result.get("provider")
+            provider_tx_id = _provider_transaction_id(result)
+            entry.status = "processing"
+            entry.provider = result.get("provider")
             entry.reference = ref
+            entry.provider_transaction_id = provider_tx_id
+            entry.payout_status = "submitted"
+            entry.payout_reference = ref
+            entry.payout_error = None
             entry.error_msg = None
-            entry.paid_at   = datetime.utcnow()
-            entry.qreek_fee    = 0.0
+            entry.paid_at = datetime.utcnow()
+            entry.qreek_fee = 0.0
             entry.provider_fee = 0.0
-            run.paid_count  = (run.paid_count or 0) + 1
             run.failed_count = max(0, (run.failed_count or 1) - 1)
             tx = Transaction(
                 user_phone=phone, tx_type="payroll_retry",
@@ -1188,11 +1342,13 @@ async def retry_all_failed(
                 qreek_fee=0.0, provider_fee=0.0,
                 net_amount=entry.gross_amount, status=entry.status,
                 provider=entry.provider, reference=entry.reference,
+                payout_status=entry.payout_status, payout_reference=entry.payout_reference, payout_error=entry.payout_error,
+                provider_transaction_id=entry.provider_transaction_id,
                 payment_description=f"Payroll retry {run.period_label} — {entry.employee_name}",
             )
             db.add(tx)
             results["success"] += 1
-            results["details"].append({"employee": entry.employee_name, "status": "completed"})
+            results["details"].append({"employee": entry.employee_name, "status": "processing"})
 
             # SMS notification for retried payout
             try:
@@ -1211,6 +1367,9 @@ async def retry_all_failed(
             logger.warning("payroll.bulk_retry.entry_fail: run=%s employee=%r error=%s", run_id, entry.employee_name, str(e)[:200])
             results["failed"] += 1
             entry.error_msg = str(e)[:200]
+            entry.status = "failed"
+            entry.payout_status = "failed"
+            entry.payout_error = str(e)[:500]
             try:
                 await refund_company_wallet(db, co.id, entry.gross_amount)
             except Exception:
@@ -1219,11 +1378,9 @@ async def retry_all_failed(
         db.add(entry)
 
     logger.info("payroll.bulk_retry.done: run=%s success=%d failed=%d", run_id, results["success"], results["failed"])
-    if run.failed_count == 0:
-        run.status = "completed"
-    elif run.paid_count > 0:
-        run.status = "partial"
-    else:
+    if results["success"]:
+        run.status = "processing"
+    elif results["failed"]:
         run.status = "failed"
 
     await db.commit()
@@ -1350,10 +1507,11 @@ async def create_payroll_checkout(
     db.add(tx)
     await db.flush()
 
+    frontend_url = os.getenv("FRONTEND_URL", "https://qreekfinance.org").rstrip("/")
     checkout = await initialize_checkout(
         tx_ref=ref, amount=checkout_amount,
         customer_name=co.name, customer_phone=phone,
-        redirect_url=None,
+        redirect_url=f"{frontend_url}/enterprise/payroll/{run.id}/checkout/return",
         title=f"Payroll — {run.period_label}",
         description=f"₦{run.total_gross:,.2f} salaries + ₦{qreek_fee:,.2f} Qreek fee + ₦{provider_fee:,.2f} processing fee — {co.name}",
         metadata={"company_id": co.id, "run_id": run.id, "tx_ref": ref},
@@ -1372,6 +1530,54 @@ async def create_payroll_checkout(
         "reference": ref,
         "message": "Proceed to Flutterwave checkout to pay for this payroll run.",
     }
+
+
+@router.post("/runs/{run_id}/checkout/confirm")
+async def confirm_payroll_checkout(
+    run_id: str,
+    body: PayrollCheckoutConfirmIn,
+    claims: dict = Depends(decode_token),
+    db: AsyncSession = Depends(get_db),
+    company_id: Optional[str] = Header(None, alias="x-company-id"),
+):
+    """
+    Finalizes a payroll checkout after Flutterwave redirects the browser back.
+    """
+    phone = claims["phone"]
+    co = await _get_company(db, phone, company_id)
+    logger.info(
+        "payroll.checkout.return.received: run=%s company=%s tx_ref=%s transaction_id=%s status=%s",
+        run_id,
+        co.id,
+        body.tx_ref,
+        body.transaction_id,
+        body.status or "successful",
+    )
+
+    run_result = await db.execute(select(PayrollRun).where(PayrollRun.id == run_id, PayrollRun.company_id == co.id))
+    run = run_result.scalar_one_or_none()
+    if not run:
+        logger.warning("payroll.checkout.return.failed: run=%s company=%s reason=run_not_found", run_id, co.id)
+        raise HTTPException(status_code=404, detail="Payroll run not found.")
+
+    if body.tx_ref and not body.tx_ref.startswith("QRK_PRCK_"):
+        logger.warning("payroll.checkout.return.failed: run=%s tx_ref=%s reason=invalid_reference", run_id, body.tx_ref)
+        raise HTTPException(status_code=400, detail="Invalid payroll checkout reference.")
+
+    normalized_status = (body.status or "successful").lower()
+    if normalized_status in {"completed", "complete", "success", "approved"}:
+        normalized_status = "successful"
+
+    payload = {"data": {"status": normalized_status}}
+    result = await finalize_payroll_checkout(db, body.tx_ref, body.transaction_id, payload)
+    logger.info(
+        "payroll.checkout.return.confirmed: run=%s tx_ref=%s transaction_id=%s result=%s",
+        run_id,
+        body.tx_ref,
+        body.transaction_id,
+        result.get("status"),
+    )
+    return {"message": "Payroll checkout confirmed.", "result": result, "run_id": run.id}
 
 
 class SetPaymentPinIn(BaseModel):
