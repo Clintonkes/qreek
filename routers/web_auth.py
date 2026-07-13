@@ -170,7 +170,10 @@ async def register(body: RegisterBody, request: Request, db: AsyncSession = Depe
     if body.referral_code:
         await apply_referral(db, phone, body.referral_code)
 
-    await set_state(phone, State.VERIFIED)
+    try:
+        await set_state(phone, State.VERIFIED)
+    except Exception as redis_exc:
+        logger.warning("register.redis_state.failed: phone=%s error=%s", phone, str(redis_exc)[:200])
 
     tokens = await issue_session_tokens(db, phone, request)
     await db.commit()
