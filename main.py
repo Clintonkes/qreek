@@ -29,12 +29,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("qreek.api")
 
+_EXTRA_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_URL", "").split(",") if o.strip()]
 ALLOWED_ORIGINS = [
     "https://qreekfinance.org",
     "https://www.qreekfinance.org",
     "http://localhost:5173",
     "http://localhost:3000",
-]
+] + _EXTRA_ORIGINS
 
 
 def _cors_headers(origin: str | None) -> dict[str, str]:
@@ -96,7 +97,7 @@ async def railway_request_logger(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS + ([os.getenv("FRONTEND_URL", "")] if os.getenv("FRONTEND_URL", "") else []),
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
