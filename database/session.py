@@ -122,6 +122,10 @@ async def _ensure_ledger_columns(conn):
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_companies_invite_token ON companies (invite_token) WHERE invite_token IS NOT NULL",
         "UPDATE companies SET address = '' WHERE address IS NULL",
         "ALTER TABLE companies ALTER COLUMN address SET NOT NULL",
+        "CREATE TABLE IF NOT EXISTS audit_log (id VARCHAR PRIMARY KEY, user_phone VARCHAR, event_type VARCHAR NOT NULL, ip_address VARCHAR, user_agent VARCHAR, detail TEXT, created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW())",
+        "CREATE INDEX IF NOT EXISTS ix_audit_log_user_phone ON audit_log (user_phone)",
+        "CREATE INDEX IF NOT EXISTS ix_audit_log_event_type ON audit_log (event_type)",
+        "CREATE INDEX IF NOT EXISTS ix_audit_log_created_at ON audit_log (created_at)",
     ]
     for statement in statements:
         await conn.exec_driver_sql(statement)

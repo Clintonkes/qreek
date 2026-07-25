@@ -61,6 +61,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Qreek Web API", version="1.0.0", lifespan=lifespan)
 
 
+_SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "X-XSS-Protection": "1; mode=block",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+}
+
+
 @app.middleware("http")
 async def railway_request_logger(request: Request, call_next):
     started = time.perf_counter()
@@ -93,6 +103,10 @@ async def railway_request_logger(request: Request, call_next):
         logger.warning(log_line)
     else:
         logger.info(log_line)
+
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers[header] = value
+
     return response
 
 app.add_middleware(

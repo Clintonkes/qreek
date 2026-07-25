@@ -1218,14 +1218,15 @@ async def pay_link(
 
     subaccounts = None
     if link.flutterwave_subaccount_id:
-        # flat_subaccount: Flutterwave deducts `transaction_charge` as a flat fee for the
-        # MAIN merchant; the subaccount gets the remainder of the settlement.
-        # Passing Qreek's exact fee here means: Qreek keeps `fee` NGN, the subaccount
-        # (recipient's bank) receives everything else (≈ recipient_amount after FLW's cut).
+        # "flat" type: the SUBACCOUNT receives exactly `transaction_charge` (recipient_amount).
+        # Main (Qreek) keeps everything else — its 0.25% commission plus any unspent
+        # provider-fee buffer (the N25-floor estimate excess). This is the only type that
+        # correctly isolates the link creator's payout regardless of the subaccount's
+        # default split_value or Flutterwave's fee variance.
         subaccounts = [{
             "id": link.flutterwave_subaccount_id,
-            "transaction_charge_type": "flat_subaccount",
-            "transaction_charge": fee,
+            "transaction_charge_type": "flat",
+            "transaction_charge": recipient_amount,
         }]
 
     checkout = await initialize_checkout(

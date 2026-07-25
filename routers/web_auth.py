@@ -33,6 +33,7 @@ from services.security_service import (
 from core.web_jwt import decode_token, issue_session_tokens, refresh_session_tokens, revoke_all_sessions, revoke_session
 from core.banks import BANKS, resolve_bank
 from core.session import set_state, State
+from services.audit_service import log_audit
 import redis.asyncio as aioredis
 import logging
 import os, re
@@ -72,6 +73,20 @@ async def _redis_call(method: str, *args, default=None, required: bool = False):
         if required:
             raise HTTPException(status_code=503, detail="Authentication cache is temporarily unavailable. Please try again.")
         return default
+
+
+_LOGIN_RATE_LIMIT = 10
+_LOGIN_RATE_WINDOW = 900  # 15 minutes
+
+
+async def _check_ip_login_rate(request: Request) -> None:
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+    key = f"login_rate:{ip}"
+    count = await _redis_call("incr", key)
+    if count == 1:
+        await _redis_call("expire", key, _LOGIN_RATE_WINDOW)
+    if count and count > _LOGIN_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail=f"Too many login attempts from this IP. Try again in 15 minutes.")
 
 
 def normalise_phone(phone: str) -> str:
@@ -182,32 +197,36 @@ async def register(body: RegisterBody, request: Request, db: AsyncSession = Depe
 
 @router.post("/login")
 async def login(body: LoginBody, request: Request, db: AsyncSession = Depends(get_db)):
-    """
-    Authenticates a user via phone and PIN.
-    Checks for account freezing, handles PIN verification, and implements 
-    a rate-limiting mechanism for failed attempts. Issues session tokens on success.
-    """
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+    ua = request.headers.get("user-agent", "")
+    await _check_ip_login_rate(request)
+
     phone  = normalise_phone(body.phone)
     result = await db.execute(select(User).where(User.phone == phone))
     user   = result.scalar_one_or_none()
 
     if not user or not user.onboarding_done:
+        await log_audit(db, event_type="login.account_not_found", ip_address=ip, user_agent=ua, detail=body.phone[:20])
         raise HTTPException(status_code=401, detail="Account not found. Please register first.")
 
     if await is_frozen(db, phone):
+        await log_audit(db, event_type="login.account_frozen", user_phone=phone, ip_address=ip, user_agent=ua)
         raise HTTPException(status_code=403, detail="Account frozen after too many failed PIN attempts. Contact support.")
 
     ok = await verify_transaction_pin(db, phone, body.pin)
     if not ok:
         if await is_frozen(db, phone):
+            await log_audit(db, event_type="login.account_frozen_now", user_phone=phone, ip_address=ip, user_agent=ua)
             raise HTTPException(status_code=403, detail="Account frozen after 5 failed attempts.")
         remaining = await pin_attempts_remaining(db, phone)
+        await log_audit(db, event_type="login.pin_failed", user_phone=phone, ip_address=ip, user_agent=ua, detail=f"attempts_remaining={remaining}")
         if remaining > 0:
             raise HTTPException(status_code=401, detail=f"Incorrect PIN. {remaining} attempts remaining.")
         raise HTTPException(status_code=401, detail="Incorrect PIN. Please try again.")
 
     tokens = await issue_session_tokens(db, phone, request)
     await db.commit()
+    await log_audit(db, event_type="login.success", user_phone=phone, ip_address=ip, user_agent=ua)
     return {**tokens, "user": user_to_dict(user)}
 
 
@@ -287,6 +306,7 @@ async def set_initial_pin(
 @router.post("/change-pin")
 async def change_pin(
     body: ChangePinBody,
+    request: Request,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
@@ -295,27 +315,30 @@ async def change_pin(
     Requires the current PIN for verification.
     """
     phone = claims["phone"]
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
     if not await verify_pin(db, phone, body.current_pin):
+        await log_audit(db, event_type="pin.change_failed", user_phone=phone, ip_address=ip, detail="wrong current PIN")
         raise HTTPException(status_code=401, detail="Current PIN is incorrect")
     if not re.match(r"^\d{4,6}$", body.new_pin):
         raise HTTPException(status_code=400, detail="New PIN must be 4–6 digits")
     await set_pin(db, phone, body.new_pin)
+    await log_audit(db, event_type="pin.changed", user_phone=phone, ip_address=ip)
     return {"message": "PIN changed successfully"}
 
 
 @router.post("/save-bank")
 async def save_bank_route(
     body: SaveBankBody,
+    request: Request,
     claims: dict = Depends(decode_token),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Saves or updates the bank account details for the authenticated user.
-    """
     phone     = claims["phone"]
+    ip        = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
     bank      = resolve_bank(body.bank_code)
     bank_name = bank["name"] if bank else body.bank_code
     await save_bank(db, phone, body.account_number, body.bank_code, bank_name)
+    await log_audit(db, event_type="bank.saved", user_phone=phone, ip_address=ip, detail=f"bank={bank_name} last4={body.account_number[-4:]}")
     return {"message": "Bank account saved", "bank_name": bank_name}
 
 
@@ -386,7 +409,7 @@ async def verify_otp(body: VerifyOtpBody, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/reset-pin")
-async def reset_pin(body: ResetPinBody, db: AsyncSession = Depends(get_db)):
+async def reset_pin(body: ResetPinBody, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Resets the user's PIN using a valid reset token.
     Unfreezes the account and clears failed attempt counters upon success.
@@ -401,10 +424,12 @@ async def reset_pin(body: ResetPinBody, db: AsyncSession = Depends(get_db)):
     user   = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="Account not found.")
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
     await set_pin(db, phone, body.new_pin)
     from services.security_service import unfreeze_account
     await unfreeze_account(db, phone)
     await _redis_call("delete", f"reset_token:{phone}", required=True)
     await _redis_call("delete", f"web_pin_fail:{phone}")
+    await log_audit(db, event_type="pin.reset_completed", user_phone=phone, ip_address=ip)
     return {"message": "PIN reset successfully. You can now sign in."}
 

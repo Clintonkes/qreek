@@ -3,7 +3,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database.models import UserSecurity, Company
 
-pwd_ctx = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+pwd_ctx = CryptContext(
+    schemes=["bcrypt", "pbkdf2_sha256"],
+    deprecated=["pbkdf2_sha256"],
+    bcrypt__rounds=12,
+)
 MAX_PIN_ATTEMPTS = 5
 
 
@@ -22,15 +26,15 @@ async def set_pin(db: AsyncSession, phone: str, pin: str):
 
 
 async def verify_pin(db: AsyncSession, phone: str, pin: str) -> bool:
-    """
-    Verifies the provided PIN against the hashed PIN stored in the database for a user.
-    Returns True if the PIN is correct, False otherwise.
-    """
     result = await db.execute(select(UserSecurity).where(UserSecurity.phone == phone))
     sec    = result.scalar_one_or_none()
     if not sec or not sec.pin_hash:
         return False
-    return pwd_ctx.verify(pin, sec.pin_hash)
+    ok, new_hash = pwd_ctx.verify_and_update(pin, sec.pin_hash)
+    if ok and new_hash:
+        sec.pin_hash = new_hash
+        await db.commit()
+    return ok
 
 
 async def verify_transaction_pin(db: AsyncSession, phone: str, pin: str) -> bool:
@@ -45,9 +49,11 @@ async def verify_transaction_pin(db: AsyncSession, phone: str, pin: str) -> bool
     if not sec or not sec.pin_hash or sec.account_frozen:
         return False
 
-    ok = pwd_ctx.verify(pin, sec.pin_hash)
+    ok, new_hash = pwd_ctx.verify_and_update(pin, sec.pin_hash)
     if ok:
         sec.failed_pin_count = 0
+        if new_hash:
+            sec.pin_hash = new_hash
         await db.commit()
         return True
 
