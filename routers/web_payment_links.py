@@ -462,29 +462,12 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
         },
     )
 
-    # ERROR (before this fix, lines ~316-418 in finalize_flutterwave_link_payment + _ensure:189-198):
-    # - If link had flutterwave_subaccount_id (we passed subaccounts override to /payments at checkout),
-    #   but due to wrong split_value=0.9975 at sub create (lines 218,494 pre-fix) + wrong override
-    #   "flat_subaccount" + recipient_amount (large) at pay_link:640 pre-fix, FW allocated the recipient
-    #   share to main merchant balance instead of sub (reversed split). See user's logs: settled 100.09
-    #   to main, test recipient bank got 0, "split.completed" logged anyway, then polling showed pending.
-    # - Even when sub failed, _ensure allowed checkout to proceed (comment: "manual transfer payout path will handle").
-    # - finalize then fell through (if not use_split or no sub id) to create_transfer (the fallback path).
-    # - System behaviour with error: link payments (non-pool) did not reliably split at success; either
-    #   wrong party got funds or transfer was attempted (which fails with IP whitelist on prod). User had
-    #   to create new links per test bank (violating "create once, edit bank" + one-active-per-user at 441-445).
-    # FIX: (a) set split_value=0.0025 at both sub creates (now lines 218,494); (b) send correct override
-    #   at checkout time: "flat" + qreek_fee (main's exact commission) -- now lines 652-655; (c) in
-    #   finalize, *always* take split_settlement path (no transfer) when the link had subaccount_id at
-    #   checkout (meaning we instructed split); (d) remove all transfer/insufficient/ detection-fallback
-    #   code from this function (no more fallback); (e) block in pay_link if no sub ready. This enforces
-    #   "payments to split at the point of payment success" with no transfer fallback.
-    # System behaviour *with* fix: For a link with sub id (ensured or created at edit/create), checkout
-    #   is initialized with subaccounts override telling FW "main gets flat= qreek_fee, sub gets rest".
-    #   On charge success + verify, we mark split_settlement + completed immediately (no create_transfer).
-    #   Qreek fee stays in main FW balance via split; recipient amount settles directly to the sub's
-    #   linked bank. Old bad subs (0.9975) are still forced correct by the tx override. Edit bank (new
-    #   endpoint) lets you change test bank on the *same* unique link and gets fresh sub with good config.
+    # SETTLEMENT PATH: For links with a Flutterwave subaccount, the split happens at the
+    # point of payment — no transfer is attempted here. We simply record split_settlement
+    # and trust FW's subaccount settlement to credit the link creator's bank.
+    # The checkout was initialized with "flat_subaccount" + recipient_amount, so FW routes
+    # exactly recipient_amount to the subaccount and Qreek's main account keeps the rest
+    # (0.25% fee + unspent provider-fee buffer). See pay_link subaccounts block above.
     if link.flutterwave_subaccount_id:
         was_unsettled = tx.payout_status not in ("completed", "split_settlement")
         tx.status = "completed"
@@ -1218,14 +1201,16 @@ async def pay_link(
 
     subaccounts = None
     if link.flutterwave_subaccount_id:
-        # "flat" type: the SUBACCOUNT receives exactly `transaction_charge` (recipient_amount).
-        # Main (Qreek) keeps everything else — its 0.25% commission plus any unspent
-        # provider-fee buffer (the N25-floor estimate excess). This is the only type that
-        # correctly isolates the link creator's payout regardless of the subaccount's
-        # default split_value or Flutterwave's fee variance.
+        # "flat_subaccount": the SUBACCOUNT receives exactly `transaction_charge`
+        # (recipient_amount). Main (Qreek) keeps everything else — its 0.25% commission
+        # plus any unspent provider-fee buffer (the ₦25-floor estimate excess).
+        # NOTE: "flat" is the mirror-image opposite — main gets the flat charge, sub gets
+        # rest. Using "flat" caused Qreek's account to receive recipient_amount (₦100) and
+        # the link creator's bank to receive only the buffer excess (~₦25). Always use
+        # "flat_subaccount" when the flat charge should go to the recipient's subaccount.
         subaccounts = [{
             "id": link.flutterwave_subaccount_id,
-            "transaction_charge_type": "flat",
+            "transaction_charge_type": "flat_subaccount",
             "transaction_charge": recipient_amount,
         }]
 

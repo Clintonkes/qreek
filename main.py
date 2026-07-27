@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 from database.session import init_db
-from routers import web_auth, web_rates, web_wallet, web_pools, web_family, web_alerts, web_ws, web_payroll, web_payment_links, web_flutterwave
+from routers import web_auth, web_rates, web_wallet, web_pools, web_family, web_alerts, web_ws, web_payroll, web_payment_links, web_flutterwave, web_admin
 import os
 
 logging.basicConfig(
@@ -34,6 +34,7 @@ ALLOWED_ORIGINS = [
     "https://qreekfinance.org",
     "https://www.qreekfinance.org",
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://localhost:3000",
 ] + _EXTRA_ORIGINS
 
@@ -144,6 +145,7 @@ app.include_router(web_alerts.router)
 app.include_router(web_payroll.router)
 app.include_router(web_payment_links.router)
 app.include_router(web_flutterwave.router)
+app.include_router(web_admin.router)
 app.include_router(web_ws.router)
 
 
