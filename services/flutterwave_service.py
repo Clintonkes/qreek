@@ -116,8 +116,16 @@ async def initialize_checkout(
     if subaccounts:
         payload["subaccounts"] = subaccounts
 
+    logger.info(
+        "FW checkout init: tx_ref=%s amount=%.2f subaccounts=%s",
+        tx_ref, amount, subaccounts,
+    )
     async with _client() as client:
         response = await client.post(f"{FLW_BASE_URL}/payments", headers=_headers(), json=payload)
+        logger.info(
+            "FW checkout response: status=%s body=%s",
+            response.status_code, response.text[:500],
+        )
         response.raise_for_status()
         data = response.json()
 
@@ -130,12 +138,7 @@ async def initialize_checkout(
 async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
     """
     Returns the total fee Flutterwave will deduct from settlement for a given checkout amount.
-
-    FW's fee API returns several fields. `fee` is often only the base processing rate
-    (e.g. 1.4% NGN card) and may exclude VAT or other surcharges. `charge_amount` is the
-    total the customer pays when they bear the fee — i.e. `amount + ALL charges`. Deriving
-    the fee as `charge_amount - amount` therefore captures every component FW deducts,
-    giving an exact estimate rather than an underestimate.
+    Logs the full FW response at INFO level to assist with fee-field diagnosis.
     """
     query = urlencode({"amount": round(float(amount or 0), 2), "currency": currency})
     async with _client() as client:
@@ -144,16 +147,8 @@ async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
             logger.warning("Flutterwave fee lookup failed: %s %s", response.status_code, response.text[:300])
             return 0.0
         data = response.json().get("data", {})
-    logger.debug("FW fee API response for amount=%.2f: %s", amount, data)
-    # Prefer deriving the fee from charge_amount (total customer pays) minus the base amount.
-    # This captures all FW charges (processing fee + VAT + surcharges) in one figure.
-    charge_amount = data.get("charge_amount")
-    if charge_amount is not None:
-        derived = round(float(charge_amount) - float(amount), 2)
-        if derived > 0:
-            return derived
-    # Fallback: use explicit fee fields if charge_amount is absent or yields zero.
-    for key in ("app_fee", "fee", "merchant_fee"):
+    logger.info("FW fee API for amount=%.2f: %s", amount, data)
+    for key in ("fee", "app_fee", "merchant_fee", "charge_amount"):
         value = data.get(key)
         if value is not None:
             return round(float(value or 0), 2)
