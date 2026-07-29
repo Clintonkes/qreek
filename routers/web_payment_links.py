@@ -5,12 +5,16 @@ Payment links (non-pool) are *created once* and unique per user for security (st
 Bank details (and limited other fields) are edited on the existing link; creating a
 second active personal link is blocked.
 
-Anyone (Qreek user or not) can pay via a link. The split happens at payment success:
-Qreek collects its 0.25% fee into our FW main balance; the link creator's recipient
-amount goes to *their* bank (stored on the link) via the Flutterwave subaccount
-settlement. There is *no transfer fallback* and no create_transfer for recipient funds
-on these link payments. Split is enforced by the subaccounts override passed to
-initialize_checkout + the split_settlement path in finalize.
+Anyone (Qreek user or not) can pay via a link. Fee model:
+  - Payer pays: recipient_amount + Qreek_fee (0.25% personal / 0.15% pool) + FW_fee_estimate.
+  - Recipient receives: approximately recipient_amount (FW's actual fee vs estimate is
+    absorbed by Qreek — if actual > estimate Qreek nets slightly less; if actual < estimate
+    Qreek nets slightly more).
+  - Qreek retains: Qreek_fee in FW main merchant balance via "flat" split.
+  - FW retains: their processing fee from the settlement.
+The split happens at payment success via the Flutterwave subaccounts override passed to
+initialize_checkout ("flat" type — main gets Qreek_fee flat, subaccount gets the rest).
+There is *no transfer fallback* and no create_transfer for recipient funds.
 
 See create_link (one-active guard + edit promise), the new update_link, pay_link
 (must have sub ready), and finalize (always split if sub configured on link).
@@ -39,7 +43,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from database.session import get_db
-from database.models import FamilyGroup, FamilyMember, PaymentEvent, PaymentLink, Transaction, UserSecurity
+from database.models import FamilyGroup, FamilyMember, PaymentEvent, PaymentLink, Transaction, User, UserSecurity
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
@@ -54,9 +58,14 @@ GROUP_FEE_PCT = 0.0015  # 0.15% for group collection links (pools and family lin
 
 async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float = FEE_PCT) -> tuple[float, float, float]:
     """
-    Builds a one-time payer total where the link owner receives the requested
-    amount and Qreek's fee is added on top of that amount.
-    fee_pct: 0.0025 for personal links, 0.0015 for pool collection links.
+    Builds the checkout total the payer sees.
+
+    Design: payer pays recipient_amount + Qreek_fee + FW_fee.
+    - recipient_amount  → recipient's bank (via FW subaccount split)
+    - Qreek_fee (fee_pct %)  → Qreek's FW main merchant balance (via "flat" split)
+    - FW_fee  → derived from FW's fee API as (charge_amount − base_amount), capturing
+                all FW charges (processing fee + VAT + surcharges) so the estimate
+                matches what FW actually deducts at settlement. No buffer is added.
     """
     qreek_fee = round(recipient_amount * fee_pct, 2)
     checkout_amount = round(recipient_amount + qreek_fee, 2)
@@ -64,13 +73,6 @@ async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float 
     for _ in range(2):
         provider_fee = await query_transaction_fee(checkout_amount)
         checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
-    # Buffer: the fee query returns the local card estimate (~1.4%). Higher-cost
-    # methods (international card 3.8%, USSD) would leave the settlement short.
-    # A 50% uplift with a ₦25 floor scales with the transaction and covers most
-    # domestic variance. Any unspent buffer stays in Qreek's merchant balance.
-    buffer = max(round(provider_fee * 0.5, 2), 25.0)
-    provider_fee = round(provider_fee + buffer, 2)
-    checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
     logger.info(
         "payment_link.fee_quote: recipient=%.2f qreek_fee=%.2f provider_fee=%.2f checkout=%.2f",
         recipient_amount, qreek_fee, provider_fee, checkout_amount,
@@ -82,8 +84,8 @@ class CreateLinkIn(BaseModel):
     title:        str
     description:  str
     amount:       Optional[float] = None   # None = flexible
-    bank_account: str
-    bank_code:    str
+    bank_account: Optional[str] = None  # Personal links: omit — saved profile bank is used. Pool/family links: required.
+    bank_code:    Optional[str] = None  # Personal links: omit — saved profile bank is used. Pool/family links: required.
     expires_days: Optional[int] = None
     provider:     Optional[str] = "flutterwave"
     pool_id:      Optional[str] = None  # if set, this is a pool collection link (0.15% fee, tied to pool for history)
@@ -634,20 +636,39 @@ async def create_link(
     if not body.description.strip():
         raise HTTPException(status_code=400, detail="Description is required.")
 
-    bank = resolve_bank(body.bank_code)
+    # Resolve the bank account to use for this link.
+    # Personal links (not pool/family): must have saved bank details on their Qreek profile.
+    # Pool/family links: bank_account + bank_code must be provided in the request body.
+    is_personal = not body.pool_id and not body.family_id
+    if is_personal:
+        user_result = await db.execute(select(User).where(User.phone == phone))
+        user_profile = user_result.scalar_one_or_none()
+        if not user_profile or not user_profile.bank_account or not user_profile.bank_code:
+            raise HTTPException(
+                status_code=400,
+                detail="You must save your bank account details in your profile before creating a payment link.",
+            )
+        link_bank_account = user_profile.bank_account
+        link_bank_code = user_profile.bank_code
+        link_bank_name = user_profile.bank_name
+    else:
+        if not body.bank_account or not body.bank_code:
+            raise HTTPException(status_code=400, detail="Bank account details are required for pool and family collection links.")
+        link_bank_account = body.bank_account
+        link_bank_code = body.bank_code
+        link_bank_name = None  # resolved below
+
+    bank = resolve_bank(link_bank_code)
     if not bank:
-        raise HTTPException(status_code=400, detail=f"Invalid bank code: {body.bank_code}")
+        raise HTTPException(status_code=400, detail=f"Invalid bank code: {link_bank_code}")
+    if not link_bank_name:
+        link_bank_name = bank["name"]
 
     # For pool payment links: verify the bank details with Flutterwave before saving the link.
-    # This ensures the account is valid (account name matches etc.) using FW's resolve.
-    # File: routers/web_payment_links.py:568 (after local resolve_bank)
-    # Error: previously bank could be saved without verification for pool collection links, leading to bad subaccounts later.
-    # Fix: call resolve_account which hits /accounts/resolve ; if fails, 400 before creating link/sub.
-    # System behaviour: pool link creation now requires successful FW account verification; personal links unchanged (sub create will still fail on bad bank).
     if target_pool_id or target_family_id:
         try:
-            await resolve_account(body.bank_account, body.bank_code)
-            await log_payment_event(db, event_type="pool.link.bank.verified", reference=None, status="success", payload={"pool_id": target_pool_id, "family_id": target_family_id, "bank_code": body.bank_code})
+            await resolve_account(link_bank_account, link_bank_code)
+            await log_payment_event(db, event_type="pool.link.bank.verified", reference=None, status="success", payload={"pool_id": target_pool_id, "family_id": target_family_id, "bank_code": link_bank_code})
         except Exception as exc:
             await log_payment_event(db, event_type="pool.link.bank.verify_failed", reference=None, status="failed", message=str(exc)[:300])
             raise HTTPException(status_code=400, detail=f"Bank account verification failed using Flutterwave. Please check the account number and bank: {str(exc)[:200]}")
@@ -663,9 +684,9 @@ async def create_link(
         description=body.description,
         amount=body.amount,
         is_flexible=body.amount is None,
-        bank_account=body.bank_account,
-        bank_code=body.bank_code,
-        bank_name=bank["name"],
+        bank_account=link_bank_account,
+        bank_code=link_bank_code,
+        bank_name=link_bank_name,
         expires_at=expires_at,
         pool_id=target_pool_id,  # pool collection link if set; enables 0.15% fee + public history on checkout + data always visible after expire
         family_id=target_family_id,
@@ -685,11 +706,11 @@ async def create_link(
             db,
             event_type="flutterwave.subaccount.create.started",
             status="started",
-            payload={"link_id": link.id, "bank_code": body.bank_code, "account_number_last4": body.bank_account[-4:], "is_pool": bool(target_pool_id), "is_family": bool(target_family_id)},
+            payload={"link_id": link.id, "bank_code": link_bank_code, "account_number_last4": link_bank_account[-4:], "is_pool": bool(target_pool_id), "is_family": bool(target_family_id)},
         )
         subaccount = await create_collection_subaccount(
-            account_bank=body.bank_code,
-            account_number=body.bank_account,
+            account_bank=link_bank_code,
+            account_number=link_bank_account,
             business_name=body.title,
             business_mobile=phone,
             business_email=creator_security.recovery_email if creator_security else None,
@@ -1201,17 +1222,23 @@ async def pay_link(
 
     subaccounts = None
     if link.flutterwave_subaccount_id:
-        # "flat_subaccount": the SUBACCOUNT receives exactly `transaction_charge`
-        # (recipient_amount). Main (Qreek) keeps everything else — its 0.25% commission
-        # plus any unspent provider-fee buffer (the ₦25-floor estimate excess).
-        # NOTE: "flat" is the mirror-image opposite — main gets the flat charge, sub gets
-        # rest. Using "flat" caused Qreek's account to receive recipient_amount (₦100) and
-        # the link creator's bank to receive only the buffer excess (~₦25). Always use
-        # "flat_subaccount" when the flat charge should go to the recipient's subaccount.
+        # "flat" type: the MAIN merchant (Qreek) receives exactly `transaction_charge`
+        # (the Qreek commission = `fee`). The subaccount (link creator's bank) receives
+        # everything else after Flutterwave deducts their processing fee.
+        #
+        # Observed Flutterwave split type semantics (confirmed through live settlements):
+        #   "flat"            → Main gets transaction_charge; sub gets remainder after FW fee.
+        #   "flat_subaccount" → NOT a valid FW type; FW ignores the split entirely and
+        #                       routes everything (minus FW fee) to the subaccount, so
+        #                       Qreek's commission is never retained.
+        #
+        # Result with "flat" + fee (e.g. ₦0.25):
+        #   Qreek retains ₦0.25 in FW main merchant balance.
+        #   Link creator's bank receives checkout_amount − ₦0.25 − FW_fee (e.g. ₦124.55).
         subaccounts = [{
             "id": link.flutterwave_subaccount_id,
-            "transaction_charge_type": "flat_subaccount",
-            "transaction_charge": recipient_amount,
+            "transaction_charge_type": "flat",
+            "transaction_charge": fee,
         }]
 
     checkout = await initialize_checkout(

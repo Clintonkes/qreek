@@ -129,8 +129,13 @@ async def initialize_checkout(
 
 async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
     """
-    Asks Flutterwave for the provider fee on a checkout amount so Qreek can
-    charge the payer once and still settle the recipient's full amount.
+    Returns the total fee Flutterwave will deduct from settlement for a given checkout amount.
+
+    FW's fee API returns several fields. `fee` is often only the base processing rate
+    (e.g. 1.4% NGN card) and may exclude VAT or other surcharges. `charge_amount` is the
+    total the customer pays when they bear the fee — i.e. `amount + ALL charges`. Deriving
+    the fee as `charge_amount - amount` therefore captures every component FW deducts,
+    giving an exact estimate rather than an underestimate.
     """
     query = urlencode({"amount": round(float(amount or 0), 2), "currency": currency})
     async with _client() as client:
@@ -139,7 +144,16 @@ async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
             logger.warning("Flutterwave fee lookup failed: %s %s", response.status_code, response.text[:300])
             return 0.0
         data = response.json().get("data", {})
-    for key in ("fee", "app_fee", "merchant_fee", "charge_amount"):
+    logger.debug("FW fee API response for amount=%.2f: %s", amount, data)
+    # Prefer deriving the fee from charge_amount (total customer pays) minus the base amount.
+    # This captures all FW charges (processing fee + VAT + surcharges) in one figure.
+    charge_amount = data.get("charge_amount")
+    if charge_amount is not None:
+        derived = round(float(charge_amount) - float(amount), 2)
+        if derived > 0:
+            return derived
+    # Fallback: use explicit fee fields if charge_amount is absent or yields zero.
+    for key in ("app_fee", "fee", "merchant_fee"):
         value = data.get(key)
         if value is not None:
             return round(float(value or 0), 2)
