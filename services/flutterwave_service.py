@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 from typing import Optional
 from urllib.parse import urlencode
@@ -148,10 +149,22 @@ async def query_transaction_fee(amount: float, currency: str = "NGN") -> float:
             return 0.0
         data = response.json().get("data", {})
     logger.info("FW fee API for amount=%.2f: %s", amount, data)
-    for key in ("fee", "app_fee", "merchant_fee", "charge_amount"):
+    # Live NGN response fields (confirmed): fee, flutterwave_fee, merchant_fee, stamp_duty_fee.
+    # charge_amount equals the queried amount — NOT the total customer pays — so it is unused here.
+    # IMPORTANT: the `fee` field is the BASE processing fee only.
+    # At settlement FW also deducts 7.5% Nigerian VAT on the base fee, ceiling-rounded.
+    # Confirmed from receipt: fee=2.05 → VAT billed as ₦0.16 (ceil(2.05×7.5)/100=0.16, not 0.15).
+    # stamp_duty_fee is ₦50 flat for NGN transfers ≥ ₦10,000 (0 for smaller amounts).
+    # This function returns base_fee + vat + stamp_duty so callers get the true total FW deduction.
+    for key in ("fee", "flutterwave_fee", "app_fee", "merchant_fee"):
         value = data.get(key)
         if value is not None:
-            return round(float(value or 0), 2)
+            base_fee = round(float(value or 0), 2)
+            vat = math.ceil(base_fee * 7.5) / 100
+            stamp_duty = round(float(data.get("stamp_duty_fee") or 0), 2)
+            total = round(base_fee + vat + stamp_duty, 2)
+            logger.info("FW fee breakdown: base=%.2f vat=%.2f stamp_duty=%.2f total=%.2f", base_fee, vat, stamp_duty, total)
+            return total
     return 0.0
 
 
