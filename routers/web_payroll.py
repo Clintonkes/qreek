@@ -1606,9 +1606,16 @@ async def has_company_payment_pin(
     db: AsyncSession = Depends(get_db),
     company_id: Optional[str] = Header(None, alias="x-company-id"),
 ):
-    """Check if the company has a payroll transaction PIN set."""
+    """Check if the company has a payroll transaction PIN set. Not having a
+    company yet is a normal state for this check (most users never set one up),
+    not an error — report no PIN instead of 404ing."""
     phone = claims["phone"]
-    co    = await _get_company(db, phone, company_id)
+    try:
+        co = await _get_company(db, phone, company_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return {"has_payment_pin": False}
+        raise
     return {"has_payment_pin": bool(co.payment_pin_hash)}
 
 

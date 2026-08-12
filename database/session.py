@@ -1,6 +1,5 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool
 from database.models import Base
 from dotenv import load_dotenv
 import os, uuid
@@ -21,7 +20,10 @@ elif DATABASE_URL.startswith("postgresql://"):
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
-    poolclass=NullPool,
+    pool_size=5,
+    max_overflow=5,
+    pool_pre_ping=True,
+    pool_recycle=300,
     connect_args={
         "statement_cache_size": 0,
         "prepared_statement_cache_size": 0,
@@ -65,6 +67,7 @@ async def _ensure_ledger_columns(conn):
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_fee DOUBLE PRECISION DEFAULT 0.0",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_settled_amount DOUBLE PRECISION",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS net_amount DOUBLE PRECISION",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recipient_settled_amount DOUBLE PRECISION",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_ref VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR",
         "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR",

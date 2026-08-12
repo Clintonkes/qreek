@@ -30,6 +30,7 @@ async def flutterwave_webhook(request: Request, db: AsyncSession = Depends(get_d
     legacy_hash = request.headers.get("verif-hash")
     if not verify_webhook_signature(payload_bytes, signature, legacy_hash):
         await log_payment_event(db, event_type="flutterwave.webhook.invalid_signature", status="failed")
+        await db.commit()
         return Response(status_code=401, content="Invalid Flutterwave signature")
 
     payload = await request.json()

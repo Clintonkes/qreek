@@ -372,6 +372,24 @@ async def verify_transaction(transaction_id: str | int) -> dict:
         return response.json()
 
 
+async def verify_transaction_by_reference(tx_ref: str) -> dict:
+    """
+    Looks up a transaction by tx_ref instead of Flutterwave's numeric id.
+    Used to self-heal transactions that never received a webhook or a
+    frontend redirect confirmation (e.g. the payer's browser lost the hosted
+    checkout page while backgrounded) — we only ever hold the tx_ref we
+    generated ourselves in that case, not Flutterwave's transaction id.
+    """
+    async with _client() as client:
+        response = await client.get(
+            f"{FLW_BASE_URL}/transactions/verify_by_reference",
+            headers=_headers(),
+            params={"tx_ref": tx_ref},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 async def create_transfer(
     *,
     amount: float,

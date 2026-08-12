@@ -30,6 +30,7 @@ Flow:
 4. On success: verify + mark split_settlement (split already performed by FW).
 5. Security + limits enforced.
 """
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -47,7 +48,7 @@ from database.models import FamilyGroup, FamilyMember, PaymentEvent, PaymentLink
 from core.web_jwt import decode_token
 from core.banks import resolve_bank
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, verify_transaction
+from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, verify_transaction, verify_transaction_by_reference
 from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
@@ -65,7 +66,15 @@ async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float 
     - Qreek_fee (fee_pct %)  → Qreek's FW main merchant balance (via "flat" split)
     - FW_fee  → derived from FW's fee API as (charge_amount − base_amount), capturing
                 all FW charges (processing fee + VAT + surcharges) so the estimate
-                matches what FW actually deducts at settlement. No buffer is added.
+                matches what FW actually deducts at settlement.
+
+    IMPORTANT: with a "flat" subaccount split, Qreek's cut is guaranteed exact —
+    the *subaccount* (recipient) absorbs 100% of any gap between this estimate and
+    the real FW fee at settlement (FW's /transactions/fee quote is generic, but the
+    real fee depends on the payment method the payer actually picks — card vs bank
+    transfer vs USSD price differently). Left unbuffered, the recipient can be shorted
+    a few kobo–naira. We buffer the estimate up so any variance lands on the payer's
+    checkout total instead of the recipient's payout.
     """
     qreek_fee = round(recipient_amount * fee_pct, 2)
     checkout_amount = round(recipient_amount + qreek_fee, 2)
@@ -73,6 +82,9 @@ async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float 
     for _ in range(2):
         provider_fee = await query_transaction_fee(checkout_amount)
         checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
+    fee_buffer = max(round(provider_fee * 0.01, 2), 2.0)
+    provider_fee = round(provider_fee + fee_buffer, 2)
+    checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
     logger.info(
         "payment_link.fee_quote: recipient=%.2f qreek_fee=%.2f provider_fee=%.2f checkout=%.2f",
         recipient_amount, qreek_fee, provider_fee, checkout_amount,
@@ -150,6 +162,7 @@ def _payment_dict(tx: Transaction) -> dict:
         "provider_settled_amount": tx.provider_settled_amount,
         "net": tx.net_amount or tx.ngn_amount,
         "recipient_amount": tx.net_amount or tx.ngn_amount,
+        "recipient_settled_amount": tx.recipient_settled_amount if tx.recipient_settled_amount is not None else (tx.net_amount or tx.ngn_amount),
         "checkout_amount": tx.gross_amount or tx.amount,
         "status": tx.status,
         "provider": tx.provider,
@@ -233,6 +246,30 @@ def _provider_settled_amount(data: dict, amount: float, provider_fee: float) -> 
         if value is not None:
             return round(float(value or 0), 2)
     return round(max(float(amount or 0) - float(provider_fee or 0), 0), 2)
+
+
+def _recipient_settled_amount(data: dict, subaccount_id: Optional[str]) -> Optional[float]:
+    """
+    Extracts the exact amount Flutterwave credited to the recipient's subaccount,
+    from the verify response's meta.split_settlement_info (a JSON string keyed by
+    subaccount id, e.g. {"RS_xxx": {"merchant_commission": 52.5, "subaccount_earning": 20999.79}}).
+    This is the real, final figure — distinct from net_amount, which is only the amount
+    *intended* at checkout creation before Flutterwave's real fee was known. Returns
+    None if the field is missing/unparseable so callers can fall back to net_amount.
+    """
+    if not subaccount_id:
+        return None
+    raw = (data.get("meta") or {}).get("split_settlement_info")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        entry = parsed.get(subaccount_id)
+        if entry and entry.get("subaccount_earning") is not None:
+            return round(float(entry["subaccount_earning"]), 2)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return None
 
 
 async def _get_live_link(db: AsyncSession, code: str, *, for_payment: bool = True) -> PaymentLink:
@@ -448,6 +485,7 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     tx.provider_transaction_id = str(data.get("id") or transaction_id)
     tx.provider_fee = _provider_fee(data)
     tx.provider_settled_amount = _provider_settled_amount(data, tx.gross_amount or tx.amount, tx.provider_fee)
+    tx.recipient_settled_amount = _recipient_settled_amount(data, link.flutterwave_subaccount_id)
     recipient_amount = tx.net_amount or tx.ngn_amount
     await log_payment_event(
         db,
@@ -1312,6 +1350,25 @@ async def get_link_payment_status(
     if not tx:
         await log_payment_event(db, event_type="checkout.status.missing_reference", reference=tx_ref, status="failed")
         raise HTTPException(status_code=404, detail="Payment reference not found.")
+
+    # Self-heal: if we're still showing pending, don't just trust that — ask Flutterwave
+    # directly by tx_ref. This is the safety net for payments where neither the webhook
+    # nor the frontend's post-redirect confirm ever reached us (e.g. the payer's browser
+    # lost the hosted checkout page while backgrounded, or the webhook is misconfigured).
+    # Every poll of this endpoint gets a chance to reconcile, not just the initial redirect.
+    if tx.status not in ("completed",) and tx_ref.startswith("QRK_LNK_"):
+        try:
+            verified = await verify_transaction_by_reference(tx_ref)
+            vdata = verified.get("data", {})
+            vstatus = str(vdata.get("status", "")).lower()
+            vtransaction_id = vdata.get("id")
+            if vstatus == "successful" and vtransaction_id:
+                await log_payment_event(db, event_type="checkout.status.reconciled", reference=tx_ref, transaction_id=vtransaction_id, status="reconciling")
+                await finalize_flutterwave_link_payment(db, tx_ref, vtransaction_id)
+                await db.refresh(tx)
+        except Exception as exc:
+            logger.warning("checkout.status.reconcile_failed: ref=%s error=%s", tx_ref, str(exc)[:200])
+
     await log_payment_event(db, event_type="checkout.status.polled", reference=tx_ref, status=tx.status, payload={"payout_status": tx.payout_status})
     return {"payment": _payment_dict(tx)}
 

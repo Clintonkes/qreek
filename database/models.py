@@ -72,6 +72,10 @@ class Transaction(Base):
     provider_fee    = Column(Float, default=0.0)
     provider_settled_amount = Column(Float, nullable=True)
     net_amount      = Column(Float, nullable=True)
+    # The amount actually credited to the recipient's subaccount per Flutterwave's own
+    # split_settlement_info, as opposed to net_amount (the amount *intended* at checkout
+    # creation, before Flutterwave's real fee was known). Populated at finalize time.
+    recipient_settled_amount = Column(Float, nullable=True)
     rate            = Column(Float, nullable=True)
     fee             = Column(Float, default=0.0)
     fee_pct         = Column(Float, default=0.0)
