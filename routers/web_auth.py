@@ -157,6 +157,19 @@ class RefreshBody(BaseModel):
     refresh_token: str
 
 
+@router.get("/check-phone")
+async def check_phone(phone: str, db: AsyncSession = Depends(get_db)):
+    """
+    Fast availability check for a phone number, used by the registration form right
+    after the identity step so a duplicate number is caught before the user goes on
+    to set a PIN, instead of only failing on final submit.
+    """
+    normalised = normalise_phone(phone)
+    result   = await db.execute(select(User).where(User.phone == normalised))
+    existing = result.scalar_one_or_none()
+    return {"available": not (existing and existing.onboarding_done)}
+
+
 @router.post("/register")
 async def register(body: RegisterBody, request: Request, db: AsyncSession = Depends(get_db)):
     """

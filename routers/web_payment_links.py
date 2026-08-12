@@ -84,8 +84,8 @@ class CreateLinkIn(BaseModel):
     title:        str
     description:  str
     amount:       Optional[float] = None   # None = flexible
-    bank_account: Optional[str] = None  # Personal links: omit — saved profile bank is used. Pool/family links: required.
-    bank_code:    Optional[str] = None  # Personal links: omit — saved profile bank is used. Pool/family links: required.
+    bank_account: str  # Destination account for this link; verified via Flutterwave before creation.
+    bank_code:    str
     expires_days: Optional[int] = None
     provider:     Optional[str] = "flutterwave"
     pool_id:      Optional[str] = None  # if set, this is a pool collection link (0.15% fee, tied to pool for history)
@@ -636,42 +636,24 @@ async def create_link(
     if not body.description.strip():
         raise HTTPException(status_code=400, detail="Description is required.")
 
-    # Resolve the bank account to use for this link.
-    # Personal links (not pool/family): must have saved bank details on their Qreek profile.
-    # Pool/family links: bank_account + bank_code must be provided in the request body.
-    is_personal = not body.pool_id and not body.family_id
-    if is_personal:
-        user_result = await db.execute(select(User).where(User.phone == phone))
-        user_profile = user_result.scalar_one_or_none()
-        if not user_profile or not user_profile.bank_account or not user_profile.bank_code:
-            raise HTTPException(
-                status_code=400,
-                detail="You must save your bank account details in your profile before creating a payment link.",
-            )
-        link_bank_account = user_profile.bank_account
-        link_bank_code = user_profile.bank_code
-        link_bank_name = user_profile.bank_name
-    else:
-        if not body.bank_account or not body.bank_code:
-            raise HTTPException(status_code=400, detail="Bank account details are required for pool and family collection links.")
-        link_bank_account = body.bank_account
-        link_bank_code = body.bank_code
-        link_bank_name = None  # resolved below
+    # Every link type (personal, pool, family) collects its destination bank account
+    # in the create request and must be verified with Flutterwave before the link is saved.
+    if not body.bank_account or not body.bank_code:
+        raise HTTPException(status_code=400, detail="Bank account details are required.")
+    link_bank_account = body.bank_account
+    link_bank_code = body.bank_code
 
     bank = resolve_bank(link_bank_code)
     if not bank:
         raise HTTPException(status_code=400, detail=f"Invalid bank code: {link_bank_code}")
-    if not link_bank_name:
-        link_bank_name = bank["name"]
+    link_bank_name = bank["name"]
 
-    # For pool payment links: verify the bank details with Flutterwave before saving the link.
-    if target_pool_id or target_family_id:
-        try:
-            await resolve_account(link_bank_account, link_bank_code)
-            await log_payment_event(db, event_type="pool.link.bank.verified", reference=None, status="success", payload={"pool_id": target_pool_id, "family_id": target_family_id, "bank_code": link_bank_code})
-        except Exception as exc:
-            await log_payment_event(db, event_type="pool.link.bank.verify_failed", reference=None, status="failed", message=str(exc)[:300])
-            raise HTTPException(status_code=400, detail=f"Bank account verification failed using Flutterwave. Please check the account number and bank: {str(exc)[:200]}")
+    try:
+        await resolve_account(link_bank_account, link_bank_code)
+        await log_payment_event(db, event_type="link.bank.verified", reference=None, status="success", payload={"pool_id": target_pool_id, "family_id": target_family_id, "bank_code": link_bank_code})
+    except Exception as exc:
+        await log_payment_event(db, event_type="link.bank.verify_failed", reference=None, status="failed", message=str(exc)[:300])
+        raise HTTPException(status_code=400, detail=f"Bank account verification failed using Flutterwave. Please check the account number and bank: {str(exc)[:200]}")
 
     expires_at = None
     if body.expires_days:
