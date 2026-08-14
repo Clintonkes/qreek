@@ -66,15 +66,7 @@ async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float 
     - Qreek_fee (fee_pct %)  → Qreek's FW main merchant balance (via "flat" split)
     - FW_fee  → derived from FW's fee API as (charge_amount − base_amount), capturing
                 all FW charges (processing fee + VAT + surcharges) so the estimate
-                matches what FW actually deducts at settlement.
-
-    IMPORTANT: with a "flat" subaccount split, Qreek's cut is guaranteed exact —
-    the *subaccount* (recipient) absorbs 100% of any gap between this estimate and
-    the real FW fee at settlement (FW's /transactions/fee quote is generic, but the
-    real fee depends on the payment method the payer actually picks — card vs bank
-    transfer vs USSD price differently). Left unbuffered, the recipient can be shorted
-    a few kobo–naira. We buffer the estimate up so any variance lands on the payer's
-    checkout total instead of the recipient's payout.
+                matches what FW actually deducts at settlement. No buffer is added.
     """
     qreek_fee = round(recipient_amount * fee_pct, 2)
     checkout_amount = round(recipient_amount + qreek_fee, 2)
@@ -82,9 +74,6 @@ async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float 
     for _ in range(2):
         provider_fee = await query_transaction_fee(checkout_amount)
         checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
-    fee_buffer = max(round(provider_fee * 0.01, 2), 2.0)
-    provider_fee = round(provider_fee + fee_buffer, 2)
-    checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
     logger.info(
         "payment_link.fee_quote: recipient=%.2f qreek_fee=%.2f provider_fee=%.2f checkout=%.2f",
         recipient_amount, qreek_fee, provider_fee, checkout_amount,
