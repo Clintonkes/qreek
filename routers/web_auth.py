@@ -34,6 +34,7 @@ from core.web_jwt import decode_token, issue_session_tokens, refresh_session_tok
 from core.banks import BANKS, resolve_bank
 from core.session import set_state, State
 from services.audit_service import log_audit
+from services.sms_service import send_sms
 import redis.asyncio as aioredis
 import logging
 import os, re
@@ -385,8 +386,10 @@ import random, string
 async def forgot_pin(body: ForgotPinBody, db: AsyncSession = Depends(get_db)):
     """
     Initiates the "Forgot PIN" flow.
-    Generates a 6-digit OTP and stores it in Redis with a 10-minute expiry.
-    In development mode, the OTP is returned in the response.
+    Generates a 6-digit OTP, stores it in Redis with a 10-minute expiry, and
+    sends it via WhatsApp (falling back to SMS). In development mode, the
+    OTP is also returned in the response so the flow is testable without a
+    configured delivery channel.
     """
     phone  = normalise_phone(body.phone)
     result = await db.execute(select(User).where(User.phone == phone))
@@ -396,6 +399,7 @@ async def forgot_pin(body: ForgotPinBody, db: AsyncSession = Depends(get_db)):
 
     otp = "".join(random.choices(string.digits, k=6))
     await _redis_call("setex", f"otp:{phone}", 600, otp, required=True)
+    await send_sms(phone, f"Your Qreek code to reset your PIN is {otp}. Do not share this with anyone.", reference=phone, db=db)
 
     import os
     if os.getenv("ENVIRONMENT", "production") == "development":

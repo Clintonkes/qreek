@@ -32,11 +32,13 @@ Flow:
 """
 import json
 import logging
+import random
+import string
 import uuid
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, or_, func
 from sqlalchemy.exc import IntegrityError
@@ -44,12 +46,13 @@ from pydantic import BaseModel
 from typing import Optional
 
 from database.session import get_db
-from database.models import FamilyGroup, FamilyMember, PaymentEvent, PaymentLink, Transaction, User, UserSecurity
-from core.web_jwt import decode_token
+from database.models import FamilyGroup, FamilyMember, PaymentEvent, PaymentLink, SavedCard, Transaction, User, UserSecurity
+from core.web_jwt import decode_token, decode_token_optional, decode_card_checkout_token, issue_card_checkout_token
 from core.banks import resolve_bank
+from routers.web_auth import _redis_call, normalise_phone
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, create_collection_subaccount, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, verify_transaction, verify_transaction_by_reference
-from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms
+from services.flutterwave_service import FlutterwaveAPIError, charge_with_token, create_collection_subaccount, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, validate_charge, verify_transaction, verify_transaction_by_reference
+from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms, send_sms
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
 
@@ -67,13 +70,30 @@ async def _checkout_total_for_recipient(recipient_amount: float, fee_pct: float 
     - FW_fee  → derived from FW's fee API as (charge_amount − base_amount), capturing
                 all FW charges (processing fee + VAT + surcharges) so the estimate
                 matches what FW actually deducts at settlement. No buffer is added.
+
+    checkout_amount = recipient_amount + qreek_fee + fee(checkout_amount) is a
+    fixed point, not a formula — FW's fee is charged on the total the payer
+    pays, which itself includes that fee. Every pass below queries the fee for
+    the *previous* pass's checkout_amount, so it always lags one step behind
+    the amount that will actually be charged. FW's fee rate is ~2%, so each
+    pass shrinks that lag by roughly 98% (e.g. a ₦1,293 first-pass fee leaves
+    only a ~₦28 gap, then ~₦0.60, then ~₦0.01) — it converges fast, but a
+    single fixed pass stops one step short and quietly under-charges the
+    payer by that lagging residual, which FW then takes out of the
+    recipient's split since Qreek's own cut is a fixed flat amount. Iterate
+    to a sub-kobo convergence instead of a fixed pass count so the recipient
+    is never shorted, capped so a flaky fee API can't hang the request.
     """
     qreek_fee = round(recipient_amount * fee_pct, 2)
     checkout_amount = round(recipient_amount + qreek_fee, 2)
     provider_fee = 0.0
-    for _ in range(2):
-        provider_fee = await query_transaction_fee(checkout_amount)
-        checkout_amount = round(recipient_amount + qreek_fee + provider_fee, 2)
+    for _ in range(6):
+        new_provider_fee = await query_transaction_fee(checkout_amount)
+        new_checkout_amount = round(recipient_amount + qreek_fee + new_provider_fee, 2)
+        converged = abs(new_checkout_amount - checkout_amount) < 0.01
+        provider_fee, checkout_amount = new_provider_fee, new_checkout_amount
+        if converged:
+            break
     logger.info(
         "payment_link.fee_quote: recipient=%.2f qreek_fee=%.2f provider_fee=%.2f checkout=%.2f",
         recipient_amount, qreek_fee, provider_fee, checkout_amount,
@@ -110,6 +130,35 @@ class ConfirmFlutterwaveIn(BaseModel):
     transaction_id: Optional[str] = None
     tx_ref:         Optional[str] = None
     status:         Optional[str] = None
+    save_card:      Optional[bool] = False  # payer opted in to save this card; only honoured if they're logged in
+
+
+class ChargeSavedCardIn(BaseModel):
+    card_id:              str
+    amount:               Optional[float] = None  # required for flexible-amount links
+    payment_description:  str
+    redirect_url:         Optional[str] = None
+    checkout_token:       Optional[str] = None  # guest path: from /saved-card/verify-otp
+
+
+class ValidateCardOtpIn(BaseModel):
+    tx_ref:          str
+    flw_ref:         str
+    otp:             str
+    checkout_token:  Optional[str] = None  # guest path: from /saved-card/verify-otp
+
+
+class RequestCardOtpIn(BaseModel):
+    phone: str
+
+
+class VerifyCardOtpIn(BaseModel):
+    phone: str
+    otp:   str
+
+
+class ListGuestCardsIn(BaseModel):
+    checkout_token: str
 
 
 class VerifyBankIn(BaseModel):
@@ -163,6 +212,67 @@ def _payment_dict(tx: Transaction) -> dict:
         "payer_name": tx.payer_name,
         "payer_phone": tx.payer_phone,
     }
+
+
+def _card_dict(c: SavedCard) -> dict:
+    return {
+        "id": c.id,
+        "brand": c.card_brand,
+        "last4": c.last4,
+        "exp_month": c.exp_month,
+        "exp_year": c.exp_year,
+        "bank": c.bank,
+        "is_default": c.is_default,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+async def _save_card_token(db: AsyncSession, *, owner_phone: str, card_data: dict) -> None:
+    """
+    Upserts a SavedCard from a successful Flutterwave verify response's `card`
+    block. Only ever stores the reusable token + masked display fields — never
+    the PAN or CVV, which Qreek's backend never receives in the first place.
+    Silently no-ops if the card wasn't tokenizable (no token in the response).
+    """
+    token = card_data.get("token")
+    if not token:
+        return
+    existing_result = await db.execute(
+        select(SavedCard).where(SavedCard.owner_phone == owner_phone, SavedCard.token == token)
+    )
+    if existing_result.scalar_one_or_none():
+        return  # already saved
+
+    has_default_result = await db.execute(select(SavedCard).where(SavedCard.owner_phone == owner_phone))
+    is_first_card = has_default_result.scalar_one_or_none() is None
+
+    db.add(SavedCard(
+        owner_phone=owner_phone,
+        token=token,
+        card_brand=card_data.get("type"),
+        last4=card_data.get("last_4digits"),
+        exp_month=(card_data.get("expiry") or "").split("/")[0] or None,
+        exp_year=(card_data.get("expiry") or "").split("/")[-1] or None,
+        bank=card_data.get("issuer"),
+        is_default=is_first_card,
+    ))
+
+
+async def _resolve_checkout_phone(claims: Optional[dict], checkout_token: Optional[str]) -> str:
+    """
+    Identifies the payer for a saved-card action two ways: a real logged-in
+    Qreek session (claims), or a guest who just proved phone ownership via the
+    OTP flow below (checkout_token). Exactly one must be present.
+    """
+    if claims:
+        return claims["phone"]
+    if checkout_token:
+        return decode_card_checkout_token(checkout_token)
+    raise HTTPException(status_code=401, detail="Verify your phone to use a saved card.")
+
+
+def _client_ip(request: Request) -> str:
+    return request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
 
 
 def _public_pool_payment_dict(tx: Transaction) -> dict:
@@ -421,7 +531,12 @@ async def _ensure_link_subaccount(db: AsyncSession, link: PaymentLink) -> None:
         raise HTTPException(status_code=502, detail="We couldn't set up your bank account for payments. Edit the link and try saving again.")
 
 
-async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, transaction_id: str | int = None) -> dict:
+async def finalize_flutterwave_link_payment(
+    db: AsyncSession,
+    tx_ref: str,
+    transaction_id: str | int = None,
+    save_card_for_phone: str | None = None,
+) -> dict:
     """
     Verifies a Flutterwave payment for a link, records the fee (which stays in main
     merchant balance via the split), and marks the tx completed with payout_status=split_settlement.
@@ -429,6 +544,12 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
     performed by Flutterwave because we passed the subaccounts override when creating
     the hosted checkout (see pay_link + initialize_checkout). There is no create_transfer
     / transfer fallback for link recipient funds.
+
+    save_card_for_phone: pass the payer's verified Qreek phone (from a decoded JWT,
+    never from the self-reported payer_phone form field) to opt this payer into
+    saving the card token for one-tap repeat checkout. None skips saving entirely —
+    the default for anonymous payers and for the webhook/status-poll callers that
+    have no verified identity to attach a card to.
     """
     tx_result = await db.execute(select(Transaction).where(Transaction.reference == tx_ref).with_for_update())
     tx = tx_result.scalar_one_or_none()
@@ -490,6 +611,9 @@ async def finalize_flutterwave_link_payment(db: AsyncSession, tx_ref: str, trans
             "provider_settled_amount": tx.provider_settled_amount,
         },
     )
+
+    if save_card_for_phone:
+        await _save_card_token(db, owner_phone=save_card_for_phone, card_data=data.get("card") or {})
 
     # SETTLEMENT PATH: For links with a Flutterwave subaccount, the split happens at the
     # point of payment — no transfer is attempted here. We simply record split_settlement
@@ -1297,6 +1421,7 @@ async def pay_link(
 async def confirm_flutterwave_link_payment(
     code: str,
     body: ConfirmFlutterwaveIn,
+    claims: Optional[dict] = Depends(decode_token_optional),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1310,8 +1435,240 @@ async def confirm_flutterwave_link_payment(
         await log_payment_event(db, event_type="flutterwave.redirect.missing_tx_ref", transaction_id=body.transaction_id, status="failed")
         raise HTTPException(status_code=400, detail="Missing Flutterwave tx_ref.")
     await log_payment_event(db, event_type="flutterwave.redirect.received", reference=body.tx_ref, transaction_id=body.transaction_id, status=body.status)
-    result = await finalize_flutterwave_link_payment(db, body.tx_ref, body.transaction_id)
+    # Only a payer who is actually logged into Qreek (verified via JWT, not the
+    # self-reported phone typed into the pay form) can opt a card into being saved.
+    save_card_for_phone = claims["phone"] if (claims and body.save_card) else None
+    result = await finalize_flutterwave_link_payment(db, body.tx_ref, body.transaction_id, save_card_for_phone=save_card_for_phone)
     return result
+
+
+@router.post("/pay/{code}/saved-card/request-otp")
+async def request_card_checkout_otp(code: str, body: RequestCardOtpIn, request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Guest saved-card entry point: a payer who isn't logged into Qreek proves
+    they own a phone number that has saved cards, without a full login. Always
+    returns the same generic message regardless of whether the number has a
+    Qreek account or saved cards — otherwise this endpoint would let anyone
+    enumerate which phone numbers are Qreek users just by watching the response.
+    """
+    generic = {"message": "If that number has a saved card, a code has been sent."}
+    phone = normalise_phone(body.phone)
+
+    ip = _client_ip(request)
+    ip_count = await _redis_call("incr", f"checkout_otp_req_ip:{ip}")
+    if ip_count == 1:
+        await _redis_call("expire", f"checkout_otp_req_ip:{ip}", 900)
+    if ip_count and ip_count > 15:
+        raise HTTPException(status_code=429, detail="Too many code requests. Try again in 15 minutes.")
+
+    phone_count = await _redis_call("incr", f"checkout_otp_req:{phone}")
+    if phone_count == 1:
+        await _redis_call("expire", f"checkout_otp_req:{phone}", 900)
+    if phone_count and phone_count > 5:
+        return generic  # rate-limited, but don't reveal that distinctly from "no cards"
+
+    user_result = await db.execute(select(User).where(User.phone == phone))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        return generic
+
+    has_card = await db.execute(select(SavedCard.id).where(SavedCard.owner_phone == phone).limit(1))
+    if not has_card.scalar_one_or_none():
+        return generic
+
+    otp = "".join(random.choices(string.digits, k=6))
+    await _redis_call("setex", f"checkout_card_otp:{phone}", 300, otp)
+    await _redis_call("delete", f"checkout_otp_try:{phone}")
+    await send_sms(
+        phone,
+        f"Your Qreek code to pay with your saved card is {otp}. Do not share this with anyone.",
+        reference=code,
+        db=db,
+    )
+    return generic
+
+
+@router.post("/pay/{code}/saved-card/verify-otp")
+async def verify_card_checkout_otp(code: str, body: VerifyCardOtpIn, db: AsyncSession = Depends(get_db)):
+    """
+    Verifies the code from request-otp and, on success, issues a narrow,
+    10-minute checkout_token — proof of phone ownership, nothing more. It
+    cannot reach the dashboard, wallet, or any endpoint that expects a real
+    login (decode_token rejects its typ outright).
+    """
+    phone = normalise_phone(body.phone)
+
+    tries = await _redis_call("incr", f"checkout_otp_try:{phone}")
+    if tries == 1:
+        await _redis_call("expire", f"checkout_otp_try:{phone}", 600)
+    if tries and tries > 5:
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+    stored = await _redis_call("get", f"checkout_card_otp:{phone}")
+    if not stored or stored != body.otp.strip():
+        raise HTTPException(status_code=400, detail="Incorrect or expired code. Request a new one.")
+
+    await _redis_call("delete", f"checkout_card_otp:{phone}")
+    await _redis_call("delete", f"checkout_otp_try:{phone}")
+    return {"checkout_token": issue_card_checkout_token(phone)}
+
+
+@router.post("/pay/{code}/saved-card/cards")
+async def list_guest_saved_cards(code: str, body: ListGuestCardsIn, db: AsyncSession = Depends(get_db)):
+    """Lists a phone-verified guest's saved cards for this checkout."""
+    phone = decode_card_checkout_token(body.checkout_token)
+    result = await db.execute(select(SavedCard).where(SavedCard.owner_phone == phone).order_by(SavedCard.created_at.desc()))
+    return {"cards": [_card_dict(c) for c in result.scalars().all()]}
+
+
+@router.post("/pay/{code}/charge-saved-card")
+async def charge_saved_card(
+    code: str,
+    body: ChargeSavedCardIn,
+    claims: Optional[dict] = Depends(decode_token_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pays a link using a previously saved card token — no redirect to Flutterwave's
+    hosted checkout. Nigerian cards usually still need one OTP step-up even when
+    tokenized; a "requires_otp" response means the payer must be prompted for the
+    code Flutterwave just sent them, then POST it to /pay/{code}/validate-card-otp.
+    Works for a payer who is fully logged into Qreek (claims) or a guest who
+    just verified their phone via the OTP flow above (body.checkout_token) —
+    either way, saved cards are never usable by someone who hasn't proven they
+    own the phone number the card is attached to.
+    """
+    phone = await _resolve_checkout_phone(claims, body.checkout_token)
+
+    link = await _get_live_link(db, code)
+    await _ensure_link_subaccount(db, link)
+    if not link.flutterwave_subaccount_id:
+        await log_payment_event(db, event_type="card.charge.subaccount_missing", reference=code, status="failed")
+        raise HTTPException(
+            status_code=502,
+            detail="We couldn't prepare this link for receiving payments right now. Please edit the bank details on the link and try again.",
+        )
+
+    card_result = await db.execute(select(SavedCard).where(SavedCard.id == body.card_id, SavedCard.owner_phone == phone))
+    card = card_result.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Saved card not found.")
+
+    recipient_amount = link.amount if not link.is_flexible else body.amount
+    if not recipient_amount or recipient_amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount.")
+    payment_description = (body.payment_description or "").strip()
+    if not payment_description:
+        raise HTTPException(status_code=400, detail="Payment description is required.")
+
+    user_result = await db.execute(select(User).where(User.phone == phone))
+    user = user_result.scalar_one_or_none()
+    payer_name = user.name if (user and user.name) else phone
+
+    link_fee_pct = GROUP_FEE_PCT if (link.pool_id or link.family_id) else FEE_PCT
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(recipient_amount, fee_pct=link_fee_pct)
+
+    ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
+    tx = Transaction(
+        user_phone=link.created_by,
+        tx_type="payment_link",
+        currency="NGN",
+        amount=checkout_amount,
+        ngn_amount=recipient_amount,
+        gross_amount=checkout_amount,
+        qreek_fee=fee,
+        provider_fee=provider_fee_estimate,
+        provider_settled_amount=round(checkout_amount - provider_fee_estimate, 2),
+        net_amount=recipient_amount,
+        fee=fee,
+        fee_pct=link_fee_pct,
+        status="pending",
+        provider="flutterwave",
+        reference=ref,
+        tx_ref=ref,
+        idempotency_key=f"card:{card.id}:{ref}",
+        payment_description=payment_description,
+        payer_name=payer_name,
+        payer_phone=phone,
+        pool_id=link.id,
+        source_pool_id=link.pool_id,
+        family_id=link.family_id,
+        bank_account=link.bank_account,
+        bank_code=link.bank_code,
+        bank_name=link.bank_name,
+    )
+    db.add(tx)
+    await db.commit()
+    await log_payment_event(db, event_type="card.charge.started", reference=ref, status="started", payload={"card_id": card.id, "checkout_amount": checkout_amount})
+
+    subaccounts = [{
+        "id": link.flutterwave_subaccount_id,
+        "transaction_charge_type": "flat",
+        "transaction_charge": fee,
+    }]
+
+    try:
+        charge = await charge_with_token(
+            token=card.token,
+            tx_ref=ref,
+            amount=checkout_amount,
+            email=f"{phone}@qreekfinance.org",
+            subaccounts=subaccounts,
+        )
+    except FlutterwaveAPIError as exc:
+        tx.status = "failed"
+        tx.payout_error = str(exc)[:500]
+        await log_payment_event(db, event_type="card.charge.failed", reference=ref, status="failed", message=str(exc)[:500])
+        await db.commit()
+        raise HTTPException(status_code=502, detail="Card charge failed. Try again or use a different card.")
+
+    charge_data = charge.get("data", {})
+    charge_status = str(charge_data.get("status", "")).lower()
+    provider_tx_id = charge_data.get("id")
+
+    if charge_status == "successful":
+        return await finalize_flutterwave_link_payment(db, ref, provider_tx_id)
+
+    # Field names for the pending/OTP case come from Flutterwave's tokenized-charge
+    # docs — confirm against a live sandbox response before shipping, these are a
+    # common source of drift between Flutterwave API versions.
+    if charge_status in ("pending", "otp_required") and charge_data.get("flw_ref"):
+        tx.provider_transaction_id = str(provider_tx_id) if provider_tx_id else None
+        await log_payment_event(db, event_type="card.charge.otp_required", reference=ref, transaction_id=provider_tx_id, status="pending", payload={"flw_ref": charge_data.get("flw_ref")})
+        await db.commit()
+        return {"requires_otp": True, "tx_ref": ref, "flw_ref": charge_data.get("flw_ref")}
+
+    tx.status = "failed"
+    await log_payment_event(db, event_type="card.charge.rejected", reference=ref, status=charge_status or "failed", payload=charge_data)
+    await db.commit()
+    raise HTTPException(status_code=400, detail=charge.get("message") or "Card charge was not successful.")
+
+
+@router.post("/pay/{code}/validate-card-otp")
+async def validate_card_otp(
+    code: str,
+    body: ValidateCardOtpIn,
+    claims: Optional[dict] = Depends(decode_token_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Completes a saved-card charge that came back pending an OTP step-up."""
+    phone = await _resolve_checkout_phone(claims, body.checkout_token)
+    tx_result = await db.execute(select(Transaction).where(Transaction.reference == body.tx_ref, Transaction.payer_phone == phone))
+    if not tx_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Payment reference not found.")
+
+    try:
+        validated = await validate_charge(otp=body.otp, flw_ref=body.flw_ref)
+    except FlutterwaveAPIError:
+        await log_payment_event(db, event_type="card.otp.failed", reference=body.tx_ref, status="failed")
+        raise HTTPException(status_code=400, detail="Incorrect or expired code. Please try again.")
+
+    vdata = validated.get("data", {})
+    if str(vdata.get("status", "")).lower() != "successful":
+        await log_payment_event(db, event_type="card.otp.rejected", reference=body.tx_ref, status=vdata.get("status"))
+        raise HTTPException(status_code=400, detail="That code didn't work. Please try again.")
+
+    return await finalize_flutterwave_link_payment(db, body.tx_ref, vdata.get("id"))
 
 
 @router.get("/pay/{code}/status/{tx_ref}")

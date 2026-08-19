@@ -59,6 +59,28 @@ class WebSession(Base):
     created_at                = Column(DateTime, default=datetime.utcnow)
 
 
+class SavedCard(Base):
+    """
+    A payer's tokenized card for one-tap repeat checkout on payment links.
+    `token` is Flutterwave's reusable card token, returned once a card is
+    successfully charged and tokenizable — never the PAN/CVV, which must never
+    pass through or be stored by Qreek. Charging later uses the token via
+    Flutterwave's tokenized-charges API, not raw card data.
+    """
+    __tablename__ = "saved_cards"
+    id            = Column(String, primary_key=True, default=lambda: "card_" + uuid.uuid4().hex[:12])
+    owner_phone   = Column(String, ForeignKey("users.phone"), nullable=False)
+    provider      = Column(String, default="flutterwave")
+    token         = Column(String, nullable=False)
+    card_brand    = Column(String, nullable=True)
+    last4         = Column(String, nullable=True)
+    exp_month     = Column(String, nullable=True)
+    exp_year      = Column(String, nullable=True)
+    bank          = Column(String, nullable=True)
+    is_default    = Column(Boolean, default=False)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+
 class Transaction(Base):
     __tablename__   = "transactions"
     id              = Column(String, primary_key=True, default=lambda: "tx_" + uuid.uuid4().hex[:12])

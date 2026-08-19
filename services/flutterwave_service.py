@@ -419,6 +419,55 @@ async def create_transfer(
     return {"provider": "flutterwave", **data}
 
 
+async def charge_with_token(
+    *,
+    token: str,
+    tx_ref: str,
+    amount: float,
+    email: str,
+    currency: str = "NGN",
+    subaccounts: Optional[list[dict]] = None,
+) -> dict:
+    """
+    Charges a previously tokenized card via Flutterwave's tokenized-charges
+    endpoint — no hosted checkout redirect. Nigerian cards typically still
+    require an OTP step-up even on a saved card (a CBN/card-network rule, not
+    a Flutterwave quirk), so the caller must handle a "pending" response by
+    routing the customer through validate_charge with the OTP they receive.
+    """
+    payload = {"token": token, "currency": currency, "amount": amount, "email": email, "tx_ref": tx_ref}
+    if subaccounts:
+        payload["subaccounts"] = subaccounts
+    async with _client() as client:
+        response = await client.post(f"{FLW_BASE_URL}/tokenized-charges", headers=_headers(), json=payload)
+        logger.info("FW tokenized charge: tx_ref=%s status=%s body=%s", tx_ref, response.status_code, response.text[:500])
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"Tokenized charge failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+        return response.json()
+
+
+async def validate_charge(*, otp: str, flw_ref: str) -> dict:
+    """Completes a tokenized charge that came back pending an OTP step-up."""
+    async with _client() as client:
+        response = await client.post(
+            f"{FLW_BASE_URL}/validate-charge",
+            headers=_headers(),
+            json={"otp": otp, "flw_ref": flw_ref},
+        )
+        logger.info("FW validate charge: flw_ref=%s status=%s body=%s", flw_ref, response.status_code, response.text[:500])
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"OTP validation failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+        return response.json()
+
+
 def verify_webhook_hash(verif_hash: Optional[str]) -> bool:
     if not FLW_SECRET_HASH:
         logger.error("FLW_SECRET_HASH missing, cannot verify Flutterwave webhook.")

@@ -19,6 +19,7 @@ ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "30"))
 REFRESH_TOKEN_DAYS = int(os.getenv("REFRESH_TOKEN_DAYS", "30"))
 SESSION_IDLE_MINUTES = int(os.getenv("SESSION_IDLE_MINUTES", "30"))
 bearer = HTTPBearer()
+bearer_optional = HTTPBearer(auto_error=False)
 
 
 def _utcnow() -> datetime:
@@ -166,6 +167,59 @@ async def decode_token(
     session.last_activity_at = now
     await db.commit()
     return {**claims, "session_id": session.id}
+
+
+CARD_CHECKOUT_TYP = "card_checkout"
+CARD_CHECKOUT_MINUTES = 10
+
+
+def issue_card_checkout_token(phone: str) -> str:
+    """
+    A narrow, short-lived credential proving "this browser just verified it
+    controls this phone number" — issued after an OTP check on the public
+    checkout page. Deliberately NOT a real access token: typ differs from
+    "access", so decode_token/decode_token_string reject it outright, and it
+    carries no session id, so it can never touch dashboard/wallet/payroll
+    endpoints. It only ever proves enough to list and charge that phone's
+    saved cards for one guest checkout.
+    """
+    now = _utcnow()
+    payload = {
+        "typ": CARD_CHECKOUT_TYP,
+        "phone": phone,
+        "iat": now,
+        "exp": now + timedelta(minutes=CARD_CHECKOUT_MINUTES),
+    }
+    return jwt.encode(payload, SECRET, algorithm=ALGO)
+
+
+def decode_card_checkout_token(token: str) -> str:
+    """Returns the verified phone for a card-checkout token, or raises 401."""
+    try:
+        claims = jwt.decode(token, SECRET, algorithms=[ALGO])
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="This card session has expired. Verify your phone again.")
+    if claims.get("typ") != CARD_CHECKOUT_TYP or not claims.get("phone"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid card session.")
+    return claims["phone"]
+
+
+async def decode_token_optional(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_optional),
+    db: AsyncSession = Depends(get_db),
+) -> dict | None:
+    """
+    Same validation as decode_token, but returns None instead of raising when no
+    (or an invalid/expired) bearer token is present. Used on payer-facing endpoints
+    that stay public by default but should recognize a logged-in Qreek user when
+    one happens to be present — e.g. saved-card capture on payment link checkout.
+    """
+    if not creds:
+        return None
+    try:
+        return await decode_token_string(creds.credentials, db)
+    except HTTPException:
+        return None
 
 
 async def decode_token_string(token: str, db: AsyncSession) -> dict:
