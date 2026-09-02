@@ -397,7 +397,10 @@ async def forgot_pin(body: ForgotPinBody, db: AsyncSession = Depends(get_db)):
     if not user or not user.onboarding_done:
         return {"message": "If an account with that number exists, an OTP has been sent."}
 
-    otp = "".join(random.choices(string.digits, k=6))
+    # Alphanumeric, not pure digits - BulkSMSNigeria's promotional bind (their
+    # transactional bind is currently unavailable) flags purely-numeric OTP-shaped
+    # strings regardless of surrounding wording; alphanumeric is what they've confirmed gets through.
+    otp = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     await _redis_call("setex", f"otp:{phone}", 600, otp, required=True)
     # Wording matches BulkSMSNigeria support's confirmed-working template - the
     # transactional bind is currently unavailable, so this routes over the promotional
@@ -420,7 +423,7 @@ async def verify_otp(body: VerifyOtpBody, db: AsyncSession = Depends(get_db)):
     """
     phone  = normalise_phone(body.phone)
     stored = await _redis_call("get", f"otp:{phone}", required=True)
-    if not stored or stored != body.otp.strip():
+    if not stored or stored != body.otp.strip().lower():
         raise HTTPException(status_code=400, detail="Invalid or expired OTP. Request a new one.")
     await _redis_call("delete", f"otp:{phone}", required=True)
     reset_token = "".join(random.choices(string.ascii_letters + string.digits, k=40))

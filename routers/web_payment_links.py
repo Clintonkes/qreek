@@ -1476,7 +1476,10 @@ async def request_card_checkout_otp(code: str, body: RequestCardOtpIn, request: 
     if not has_card.scalar_one_or_none():
         return generic
 
-    otp = "".join(random.choices(string.digits, k=6))
+    # Alphanumeric, not pure digits - see the matching comment in web_auth.py's
+    # forgot_pin: BulkSMSNigeria's promotional bind silently drops purely-numeric
+    # OTP-shaped messages regardless of wording.
+    otp = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     await _redis_call("setex", f"checkout_card_otp:{phone}", 300, otp)
     await _redis_call("delete", f"checkout_otp_try:{phone}")
     # Wording matches BulkSMSNigeria support's confirmed-working template - the
@@ -1508,7 +1511,7 @@ async def verify_card_checkout_otp(code: str, body: VerifyCardOtpIn, db: AsyncSe
         raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
 
     stored = await _redis_call("get", f"checkout_card_otp:{phone}")
-    if not stored or stored != body.otp.strip():
+    if not stored or stored != body.otp.strip().lower():
         raise HTTPException(status_code=400, detail="Incorrect or expired code. Request a new one.")
 
     await _redis_call("delete", f"checkout_card_otp:{phone}")
