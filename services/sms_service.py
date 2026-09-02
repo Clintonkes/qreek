@@ -139,7 +139,7 @@ async def _send_via_bulksmsnigeria(
         "from": BULKSMSNIGERIA_SENDER_ID[:11],
         "to": norm_phone.lstrip("+"),
         "body": message[:1530],
-        "gateway": "otp",  # transactional/DND-safe route, not the promotional gateway
+        "gateway": "direct-corporate",  # trying this after "otp" was silently ignored (gateway_used kept coming back "direct-refund")
     }
     headers = {"Authorization": f"Bearer {BULKSMSNIGERIA_API_TOKEN}"}
 
