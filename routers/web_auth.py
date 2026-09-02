@@ -399,10 +399,10 @@ async def forgot_pin(body: ForgotPinBody, db: AsyncSession = Depends(get_db)):
 
     otp = "".join(random.choices(string.digits, k=6))
     await _redis_call("setex", f"otp:{phone}", 600, otp, required=True)
-    # Wording avoids "code"/"OTP"/"PIN" etc. - BulkSMSNigeria's transactional bind is
-    # currently unavailable, so this routes over the promotional bind, which silently
-    # drops messages containing those words instead of delivering them.
-    await send_sms(phone, f"Your Qreek verification number is {otp}. Do not share this with anyone.", reference=phone, db=db)
+    # Wording matches BulkSMSNigeria support's confirmed-working template - the
+    # transactional bind is currently unavailable, so this routes over the promotional
+    # bind, which silently drops messages containing words like "code"/"OTP"/"PIN".
+    await send_sms(phone, f"Your Qreek One-time Pass is: {otp}. Use immediately. Do not share with anyone.", reference=phone, db=db)
 
     import os
     if os.getenv("ENVIRONMENT", "production") == "development":

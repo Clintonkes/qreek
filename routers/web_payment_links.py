@@ -1479,12 +1479,12 @@ async def request_card_checkout_otp(code: str, body: RequestCardOtpIn, request: 
     otp = "".join(random.choices(string.digits, k=6))
     await _redis_call("setex", f"checkout_card_otp:{phone}", 300, otp)
     await _redis_call("delete", f"checkout_otp_try:{phone}")
-    # Wording avoids "code"/"OTP"/"PIN" etc. - BulkSMSNigeria's transactional bind is
-    # currently unavailable, so this routes over the promotional bind, which silently
-    # drops messages containing those words instead of delivering them.
+    # Wording matches BulkSMSNigeria support's confirmed-working template - the
+    # transactional bind is currently unavailable, so this routes over the promotional
+    # bind, which silently drops messages containing words like "code"/"OTP"/"PIN".
     await send_sms(
         phone,
-        f"Your Qreek verification number is {otp}. Do not share this with anyone.",
+        f"Your Qreek One-time Pass is: {otp}. Use immediately. Do not share with anyone.",
         reference=code,
         db=db,
     )
