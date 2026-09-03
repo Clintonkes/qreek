@@ -405,7 +405,7 @@ async def forgot_pin(body: ForgotPinBody, db: AsyncSession = Depends(get_db)):
     # Wording matches BulkSMSNigeria support's confirmed-working template - the
     # transactional bind is currently unavailable, so this routes over the promotional
     # bind, which silently drops messages containing words like "code"/"OTP"/"PIN".
-    await send_sms(phone, f"Your Qreek One-time Pass is: {otp}. Use immediately. Do not share with anyone.", reference=phone, db=db)
+    await send_sms(phone, f"Your One-time Pass is: {otp}. Use immediately", reference=phone, db=db)
 
     import os
     if os.getenv("ENVIRONMENT", "production") == "development":

@@ -1487,7 +1487,7 @@ async def request_card_checkout_otp(code: str, body: RequestCardOtpIn, request: 
     # bind, which silently drops messages containing words like "code"/"OTP"/"PIN".
     await send_sms(
         phone,
-        f"Your Qreek One-time Pass is: {otp}. Use immediately. Do not share with anyone.",
+        f"Your One-time Pass is: {otp}. Use immediately",
         reference=code,
         db=db,
     )
