@@ -139,7 +139,9 @@ async def _send_via_bulksmsnigeria(
         "from": BULKSMSNIGERIA_SENDER_ID[:11],
         "to": norm_phone.lstrip("+"),
         "body": message[:1530],
-        "gateway": "direct-corporate",  # trying this after "otp" was silently ignored (gateway_used kept coming back "direct-refund")
+        # No "gateway" override: forcing "otp"/"direct-corporate" had no effect (gateway_used
+        # always came back "direct-refund" regardless), so let the account's default route apply
+        # instead, matching how the dashboard's Compose tool sends (which has always delivered).
     }
     headers = {"Authorization": f"Bearer {BULKSMSNIGERIA_API_TOKEN}"}
 
