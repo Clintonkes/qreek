@@ -132,11 +132,21 @@ def user_to_dict(user: User) -> dict:
 
 
 class RegisterBody(BaseModel):
-    phone:         str
-    firstName:     str
-    lastName:      str
-    pin:           str
-    referral_code: str | None = None
+    phone:               str
+    firstName:           str
+    lastName:            str
+    pin:                 str
+    referral_code:       str | None = None
+    signup_verify_token: str | None = None
+
+
+class SendSignupOtpBody(BaseModel):
+    phone: str
+
+
+class VerifySignupOtpBody(BaseModel):
+    phone: str
+    otp:   str
 
 
 class LoginBody(BaseModel):
@@ -171,14 +181,64 @@ async def check_phone(phone: str, db: AsyncSession = Depends(get_db)):
     return {"available": not (existing and existing.onboarding_done)}
 
 
+# ── Signup phone verification ─────────────────────────────────────────────────
+
+@router.post("/send-signup-otp")
+async def send_signup_otp(body: SendSignupOtpBody, db: AsyncSession = Depends(get_db)):
+    """
+    Sends a one-time code to a phone number to prove it is real before registration.
+    Silently succeeds even if the number is already registered (anti-enumeration).
+    """
+    import random, string
+    phone  = normalise_phone(body.phone)
+    result = await db.execute(select(User).where(User.phone == phone))
+    existing = result.scalar_one_or_none()
+    if existing and existing.onboarding_done:
+        return {"message": "A verification code has been sent to your number."}
+
+    otp = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    await _redis_call("setex", f"signup_otp:{phone}", 600, otp, required=True)
+    await send_sms(phone, f"Your One-time Pass is: {otp}. Use immediately", reference=phone, db=db)
+
+    if os.getenv("ENVIRONMENT", "production") == "development":
+        print(f"[DEV] Signup OTP for {phone}: {otp}")
+        return {"message": "Code sent. [DEV] Code: " + otp, "dev_otp": otp}
+
+    return {"message": "A verification code has been sent to your number."}
+
+
+@router.post("/verify-signup-otp")
+async def verify_signup_otp(body: VerifySignupOtpBody):
+    """
+    Verifies the signup OTP. On success issues a short-lived verify_token that
+    /register accepts instead of re-sending the code.
+    """
+    import random, string
+    phone  = normalise_phone(body.phone)
+    stored = await _redis_call("get", f"signup_otp:{phone}", required=True)
+    if not stored or stored != body.otp.strip().lower():
+        raise HTTPException(status_code=400, detail="Invalid or expired code. Request a new one.")
+    await _redis_call("delete", f"signup_otp:{phone}", required=True)
+    verify_token = "".join(random.choices(string.ascii_letters + string.digits, k=40))
+    await _redis_call("setex", f"signup_verified:{phone}", 900, verify_token, required=True)
+    return {"verify_token": verify_token, "message": "Phone verified."}
+
+
 @router.post("/register")
 async def register(body: RegisterBody, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Registers a new user or completes onboarding for an existing entry.
-    Validates the phone number and PIN, sets the user name, applies referrals, 
+    Validates the phone number and PIN, sets the user name, applies referrals,
     and issues initial session tokens.
     """
     phone = normalise_phone(body.phone)
+
+    # Enforce phone verification in production.
+    if os.getenv("ENVIRONMENT", "production") != "development":
+        stored_verify = await _redis_call("get", f"signup_verified:{phone}", required=True)
+        if not stored_verify or stored_verify != body.signup_verify_token:
+            raise HTTPException(status_code=400, detail="Phone not verified. Please complete the verification step.")
+        await _redis_call("delete", f"signup_verified:{phone}", required=True)
 
     result   = await db.execute(select(User).where(User.phone == phone))
     existing = result.scalar_one_or_none()

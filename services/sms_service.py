@@ -511,7 +511,7 @@ async def send_link_payment_received_sms(
 ) -> bool:
     """Notify the link creator that money arrived (realtime to their phone)."""
     payer = (payer_name or "Someone").strip()
-    msg = f"Qreek: {payer} paid ₦{amount:,.0f} via your link '{link_title[:30]}'. Ref: {reference}. Check your dashboard for details."
+    msg = f"Qreek: {payer} paid NGN {amount:,.0f} via your link '{link_title[:30]}'. Ref: {reference}. Check your dashboard for details."
     return await send_sms(owner_phone, msg, reference=reference, db=db)
 
 
@@ -525,5 +525,5 @@ async def send_payment_receipt_sms(
 ) -> bool:
     """Send confirmation to the person who just paid (receipt + settlement note)."""
     bank_hint = f" to {owner_bank_name}" if owner_bank_name else ""
-    msg = f"Thank you! Your ₦{amount:,.0f} payment for '{link_title[:30]}' via Qreek was received. Ref: {reference}. Funds will settle{bank_hint} shortly."
+    msg = f"Thank you! Your NGN {amount:,.0f} payment for '{link_title[:30]}' via Qreek was received. Ref: {reference}. Funds will settle{bank_hint} shortly."
     return await send_sms(payer_phone, msg, reference=reference, db=db)

@@ -32,6 +32,7 @@ Flow:
 """
 import json
 import logging
+import os
 import random
 import string
 import uuid
@@ -51,10 +52,12 @@ from core.web_jwt import decode_token, decode_token_optional, decode_card_checko
 from core.banks import resolve_bank
 from routers.web_auth import _redis_call, normalise_phone
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, charge_with_token, create_collection_subaccount, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, validate_charge, verify_transaction, verify_transaction_by_reference
+from services.flutterwave_service import FlutterwaveAPIError, bank_transfer_charge, charge_with_token, create_collection_subaccount, direct_card_charge, encrypt_flutterwave_payload, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, ussd_charge, validate_charge, verify_transaction, verify_transaction_by_reference
 from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms, send_sms
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
+
+FLW_PUBLIC_KEY = os.getenv("FLW_PUBLIC_KEY", "")
 
 FEE_PCT = 0.0025  # 0.25% default for personal (non-pool) payment links
 GROUP_FEE_PCT = 0.0015  # 0.15% for group collection links (pools and family links)
@@ -159,6 +162,13 @@ class VerifyCardOtpIn(BaseModel):
 
 class ListGuestCardsIn(BaseModel):
     checkout_token: str
+
+class InlineInitIn(BaseModel):
+    name: str
+    phone: str
+    amount: Optional[float] = None       # only required for flexible-amount links
+    payment_description: str
+    idempotency_key: Optional[str] = None
 
 
 class VerifyBankIn(BaseModel):
@@ -1415,6 +1425,546 @@ async def pay_link(
         "recipient_amount": recipient_amount,
         "checkout_amount": checkout_amount,
     }
+
+
+@router.post("/pay/{code}/inline-init")
+async def init_inline_payment(
+    code: str,
+    body: InlineInitIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Creates the transaction record and returns the Flutterwave Inline SDK config.
+
+    The frontend passes this config directly to window.FlutterwaveCheckout() so
+    the payer never leaves the Qreek checkout page — card data goes from the
+    browser directly to Flutterwave and never passes through Qreek servers.
+    After the in-page callback fires, the frontend calls
+    POST /pay/{code}/flutterwave/confirm with the returned transaction_id and
+    tx_ref (the existing confirmation endpoint, unchanged).
+
+    Works for logged-in Qreek users and anonymous payers alike.
+    The FLW_PUBLIC_KEY in the response is safe to expose — it is not the secret.
+    """
+    link = await _get_live_link(db, code)
+    await _ensure_link_subaccount(db, link)
+    if not link.flutterwave_subaccount_id:
+        await log_payment_event(db, event_type="inline.subaccount.missing", reference=code, status="failed")
+        raise HTTPException(
+            status_code=502,
+            detail="We couldn't prepare this link for receiving payments right now. Please edit the bank details on the link and try again.",
+        )
+
+    payer_name = body.name.strip()
+    if not payer_name:
+        raise HTTPException(status_code=400, detail="Payer name is required.")
+    payer_phone = body.phone.strip()
+    if not payer_phone:
+        raise HTTPException(status_code=400, detail="Phone number is required.")
+
+    recipient_amount = link.amount if not link.is_flexible else body.amount
+    if not recipient_amount or recipient_amount < 100:
+        raise HTTPException(status_code=400, detail="Minimum payment is ₦100.")
+
+    payment_description = (body.payment_description or "").strip()
+    if not payment_description:
+        raise HTTPException(status_code=400, detail="Payment description is required.")
+
+    link_fee_pct = GROUP_FEE_PCT if (link.pool_id or link.family_id) else FEE_PCT
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(
+        recipient_amount, fee_pct=link_fee_pct
+    )
+
+    idempotency_key = body.idempotency_key or f"inline:{code.upper()}:{payer_phone}:{recipient_amount}:{payment_description}"
+
+    # Honour idempotency: if we already created a tx for this key return its config.
+    existing_result = await db.execute(
+        select(Transaction).where(Transaction.idempotency_key == idempotency_key).with_for_update()
+    )
+    existing = existing_result.scalar_one_or_none()
+    if existing and existing.status in ("completed", "split_settlement"):
+        return {
+            "already_paid": True,
+            "tx_ref": existing.tx_ref or existing.reference,
+            "status": existing.status,
+        }
+
+    if existing:
+        ref = existing.tx_ref or existing.reference
+    else:
+        ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
+        tx = Transaction(
+            user_phone=link.created_by,
+            tx_type="payment_link",
+            currency="NGN",
+            amount=checkout_amount,
+            ngn_amount=recipient_amount,
+            gross_amount=checkout_amount,
+            qreek_fee=fee,
+            provider_fee=provider_fee_estimate,
+            provider_settled_amount=round(checkout_amount - provider_fee_estimate, 2),
+            net_amount=recipient_amount,
+            fee=fee,
+            fee_pct=link_fee_pct,
+            status="pending",
+            provider="flutterwave",
+            reference=ref,
+            tx_ref=ref,
+            idempotency_key=idempotency_key,
+            payment_description=payment_description,
+            payer_name=payer_name,
+            payer_phone=payer_phone,
+            pool_id=link.id,
+            source_pool_id=link.pool_id,
+            family_id=link.family_id,
+            bank_account=link.bank_account,
+            bank_code=link.bank_code,
+            bank_name=link.bank_name,
+        )
+        db.add(tx)
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            existing_result = await db.execute(
+                select(Transaction).where(Transaction.idempotency_key == idempotency_key)
+            )
+            tx = existing_result.scalar_one()
+            ref = tx.reference
+        else:
+            await log_payment_event(
+                db, event_type="inline.transaction.created", reference=ref, status="pending",
+                payload={"checkout_amount": checkout_amount, "recipient_amount": recipient_amount, "qreek_fee": fee},
+            )
+
+    return {
+        "tx_ref": ref,
+        "public_key": FLW_PUBLIC_KEY,
+        "amount": checkout_amount,
+        "currency": "NGN",
+        "subaccounts": [{
+            "id": link.flutterwave_subaccount_id,
+            "transaction_charge_type": "flat",
+            "transaction_charge": fee,
+        }],
+        "customer": {
+            "email": f"{payer_phone}@qreekfinance.org",
+            "phone_number": payer_phone,
+            "name": payer_name,
+        },
+        "customizations": {
+            "title": "QreekPay",
+            "description": payment_description or link.title,
+            "logo": "https://qreekfinance.org/logo.png",
+        },
+        "meta": {
+            "code": link.code,
+            "link_id": link.id,
+            "payment_description": payment_description,
+            "qreek_fee": fee,
+            "recipient_amount": recipient_amount,
+            "checkout_amount": checkout_amount,
+        },
+        "recipient_amount": recipient_amount,
+        "fee": fee,
+        "provider_fee_estimate": provider_fee_estimate,
+        "checkout_amount": checkout_amount,
+    }
+
+
+# ── Shared helper for direct-charge transaction creation ──────────────────────
+
+async def _create_direct_charge_tx(
+    db: AsyncSession,
+    link,
+    *,
+    payer_name: str,
+    payer_phone: str,
+    recipient_amount: float,
+    checkout_amount: float,
+    fee: float,
+    fee_pct: float,
+    provider_fee_estimate: float,
+    payment_description: str,
+    idempotency_key: str,
+    ref: str,
+) -> Transaction:
+    tx = Transaction(
+        user_phone=link.created_by,
+        tx_type="payment_link",
+        currency="NGN",
+        amount=checkout_amount,
+        ngn_amount=recipient_amount,
+        gross_amount=checkout_amount,
+        qreek_fee=fee,
+        provider_fee=provider_fee_estimate,
+        provider_settled_amount=round(checkout_amount - provider_fee_estimate, 2),
+        net_amount=recipient_amount,
+        fee=fee,
+        fee_pct=fee_pct,
+        status="pending",
+        provider="flutterwave",
+        reference=ref,
+        tx_ref=ref,
+        idempotency_key=idempotency_key,
+        payment_description=payment_description,
+        payer_name=payer_name,
+        payer_phone=payer_phone,
+        pool_id=link.id,
+        source_pool_id=link.pool_id,
+        family_id=link.family_id,
+        bank_account=link.bank_account,
+        bank_code=link.bank_code,
+        bank_name=link.bank_name,
+    )
+    db.add(tx)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        r = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key))
+        tx = r.scalar_one()
+    return tx
+
+
+# ── Bank transfer direct charge ───────────────────────────────────────────────
+
+class BankTransferInitIn(BaseModel):
+    name:                str
+    phone:               str
+    amount:              Optional[float] = None
+    payment_description: str
+    idempotency_key:     Optional[str] = None
+
+
+@router.post("/pay/{code}/bank-transfer/init")
+async def init_bank_transfer(
+    code: str,
+    body: BankTransferInitIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Initializes a bank transfer charge. Flutterwave assigns a temporary virtual
+    account number that the payer transfers to. Payment is confirmed via webhook.
+    Frontend should poll GET /pay/{code}/status/{tx_ref} until status = completed.
+    """
+    link = await _get_live_link(db, code)
+    await _ensure_link_subaccount(db, link)
+    if not link.flutterwave_subaccount_id:
+        raise HTTPException(status_code=502, detail="Link is not ready for payments yet. Edit the bank details and try again.")
+
+    payer_name  = body.name.strip()
+    payer_phone = body.phone.strip()
+    if not payer_name or not payer_phone:
+        raise HTTPException(status_code=400, detail="Name and phone are required.")
+
+    recipient_amount = link.amount if not link.is_flexible else body.amount
+    if not recipient_amount or recipient_amount < 100:
+        raise HTTPException(status_code=400, detail="Minimum payment is NGN 100.")
+
+    payment_description = (body.payment_description or "").strip()
+    if not payment_description:
+        raise HTTPException(status_code=400, detail="Payment description is required.")
+
+    link_fee_pct = GROUP_FEE_PCT if (link.pool_id or link.family_id) else FEE_PCT
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(
+        recipient_amount, fee_pct=link_fee_pct
+    )
+
+    ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
+    idempotency_key = body.idempotency_key or f"bt:{code.upper()}:{payer_phone}:{recipient_amount}:{payment_description}"
+
+    existing_r = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key))
+    existing = existing_r.scalar_one_or_none()
+    if existing and existing.status in ("completed", "split_settlement"):
+        return {"already_paid": True, "tx_ref": existing.reference, "status": existing.status}
+    if existing:
+        ref = existing.reference
+
+    if not existing:
+        await _create_direct_charge_tx(
+            db, link,
+            payer_name=payer_name, payer_phone=payer_phone,
+            recipient_amount=recipient_amount, checkout_amount=checkout_amount,
+            fee=fee, fee_pct=link_fee_pct, provider_fee_estimate=provider_fee_estimate,
+            payment_description=payment_description, idempotency_key=idempotency_key, ref=ref,
+        )
+
+    try:
+        result = await bank_transfer_charge(payload={
+            "tx_ref": ref,
+            "amount": checkout_amount,
+            "currency": "NGN",
+            "email": f"{payer_phone}@qreekfinance.org",
+            "phone_number": payer_phone,
+            "fullname": payer_name,
+            "subaccounts": [{"id": link.flutterwave_subaccount_id, "transaction_charge_type": "flat", "transaction_charge": fee}],
+            "meta": {"code": code, "link_id": link.id},
+        })
+    except FlutterwaveAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Could not initialise bank transfer: {e.message}")
+
+    data = result.get("data", {})
+    meta  = data.get("meta", {})
+    authorization = data.get("authorization", {})
+    account_number   = authorization.get("transfer_account") or meta.get("authorization", {}).get("transfer_account", "")
+    account_bank     = authorization.get("transfer_bank") or meta.get("authorization", {}).get("transfer_bank", "")
+    expiry_seconds   = int(authorization.get("transfer_amount_validity") or meta.get("authorization", {}).get("transfer_amount_validity") or 1800)
+
+    return {
+        "tx_ref": ref,
+        "checkout_amount": checkout_amount,
+        "recipient_amount": recipient_amount,
+        "account_number": account_number,
+        "account_bank": account_bank,
+        "account_name": "Qreek Pay",
+        "expiry_seconds": expiry_seconds,
+    }
+
+
+# ── USSD direct charge ────────────────────────────────────────────────────────
+
+class UssdInitIn(BaseModel):
+    name:                str
+    phone:               str
+    amount:              Optional[float] = None
+    payment_description: str
+    account_bank:        str
+    idempotency_key:     Optional[str] = None
+
+
+@router.post("/pay/{code}/ussd/init")
+async def init_ussd(
+    code: str,
+    body: UssdInitIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Initializes a USSD charge. Returns a USSD code string the payer dials.
+    Payment is confirmed via webhook; frontend polls status.
+    """
+    link = await _get_live_link(db, code)
+    await _ensure_link_subaccount(db, link)
+    if not link.flutterwave_subaccount_id:
+        raise HTTPException(status_code=502, detail="Link is not ready for payments yet.")
+
+    payer_name  = body.name.strip()
+    payer_phone = body.phone.strip()
+    if not payer_name or not payer_phone:
+        raise HTTPException(status_code=400, detail="Name and phone are required.")
+
+    recipient_amount = link.amount if not link.is_flexible else body.amount
+    if not recipient_amount or recipient_amount < 100:
+        raise HTTPException(status_code=400, detail="Minimum payment is NGN 100.")
+
+    payment_description = (body.payment_description or "").strip()
+    if not payment_description:
+        raise HTTPException(status_code=400, detail="Payment description is required.")
+
+    link_fee_pct = GROUP_FEE_PCT if (link.pool_id or link.family_id) else FEE_PCT
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(
+        recipient_amount, fee_pct=link_fee_pct
+    )
+
+    ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
+    idempotency_key = body.idempotency_key or f"ussd:{code.upper()}:{payer_phone}:{recipient_amount}:{payment_description}"
+
+    existing_r = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key))
+    existing = existing_r.scalar_one_or_none()
+    if existing and existing.status in ("completed", "split_settlement"):
+        return {"already_paid": True, "tx_ref": existing.reference, "status": existing.status}
+    if existing:
+        ref = existing.reference
+
+    if not existing:
+        await _create_direct_charge_tx(
+            db, link,
+            payer_name=payer_name, payer_phone=payer_phone,
+            recipient_amount=recipient_amount, checkout_amount=checkout_amount,
+            fee=fee, fee_pct=link_fee_pct, provider_fee_estimate=provider_fee_estimate,
+            payment_description=payment_description, idempotency_key=idempotency_key, ref=ref,
+        )
+
+    try:
+        result = await ussd_charge(payload={
+            "tx_ref": ref,
+            "amount": checkout_amount,
+            "currency": "NGN",
+            "email": f"{payer_phone}@qreekfinance.org",
+            "phone_number": payer_phone,
+            "fullname": payer_name,
+            "account_bank": body.account_bank,
+        })
+    except FlutterwaveAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Could not initialise USSD: {e.message}")
+
+    data = result.get("data", {})
+    auth = data.get("authorization", data.get("meta", {}).get("authorization", {}))
+
+    return {
+        "tx_ref": ref,
+        "checkout_amount": checkout_amount,
+        "flw_ref": data.get("flw_ref", ""),
+        "payment_code": auth.get("transfer_note") or auth.get("payment_code") or auth.get("note") or "",
+        "note": auth.get("transfer_note") or auth.get("note") or "",
+    }
+
+
+# ── Card direct charge ────────────────────────────────────────────────────────
+
+class CardChargeIn(BaseModel):
+    name:                str
+    phone:               str
+    amount:              Optional[float] = None
+    payment_description: str
+    card_number:         str
+    cvv:                 str
+    expiry_month:        str
+    expiry_year:         str
+    pin:                 Optional[str] = None
+    idempotency_key:     Optional[str] = None
+
+
+class CardValidateIn(BaseModel):
+    tx_ref:  str
+    flw_ref: str
+    otp:     str
+
+
+@router.post("/pay/{code}/card/charge")
+async def charge_card_direct(
+    code: str,
+    body: CardChargeIn,
+    claims: Optional[dict] = Depends(decode_token_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Direct card charge without a Flutterwave modal or redirect.
+    Card details are encrypted 3DES client-side (see encrypt_flutterwave_payload)
+    before reaching Flutterwave — they are never stored by Qreek.
+    Returns one of:
+      { status: "success", payment }         — immediately charged
+      { status: "otp",  flw_ref, tx_ref }    — OTP step-up needed
+      { status: "pin",  tx_ref }             — re-submit with pin field populated
+      { status: "redirect", redirect_url }   — 3DS authentication required
+    """
+    link = await _get_live_link(db, code)
+    await _ensure_link_subaccount(db, link)
+    if not link.flutterwave_subaccount_id:
+        raise HTTPException(status_code=502, detail="Link is not ready for payments yet.")
+
+    payer_name  = body.name.strip()
+    payer_phone = body.phone.strip()
+    if not payer_name or not payer_phone:
+        raise HTTPException(status_code=400, detail="Name and phone are required.")
+
+    recipient_amount = link.amount if not link.is_flexible else body.amount
+    if not recipient_amount or recipient_amount < 100:
+        raise HTTPException(status_code=400, detail="Minimum payment is NGN 100.")
+
+    payment_description = (body.payment_description or "").strip()
+    if not payment_description:
+        raise HTTPException(status_code=400, detail="Payment description is required.")
+
+    link_fee_pct = GROUP_FEE_PCT if (link.pool_id or link.family_id) else FEE_PCT
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(
+        recipient_amount, fee_pct=link_fee_pct
+    )
+
+    ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
+    idempotency_key = body.idempotency_key or f"card:{code.upper()}:{payer_phone}:{recipient_amount}:{payment_description}"
+
+    existing_r = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key))
+    existing = existing_r.scalar_one_or_none()
+    if existing and existing.status in ("completed", "split_settlement"):
+        return {"already_paid": True, "tx_ref": existing.reference, "status": existing.status}
+    if existing:
+        ref = existing.reference
+    else:
+        await _create_direct_charge_tx(
+            db, link,
+            payer_name=payer_name, payer_phone=payer_phone,
+            recipient_amount=recipient_amount, checkout_amount=checkout_amount,
+            fee=fee, fee_pct=link_fee_pct, provider_fee_estimate=provider_fee_estimate,
+            payment_description=payment_description, idempotency_key=idempotency_key, ref=ref,
+        )
+
+    import json as _json
+    card_payload = {
+        "card_number":    body.card_number.replace(" ", ""),
+        "cvv":            body.cvv,
+        "expiry_month":   body.expiry_month,
+        "expiry_year":    body.expiry_year,
+        "currency":       "NGN",
+        "amount":         checkout_amount,
+        "fullname":       payer_name,
+        "email":          f"{payer_phone}@qreekfinance.org",
+        "phone_number":   payer_phone,
+        "tx_ref":         ref,
+        "redirect_url":   f"{os.getenv('FRONTEND_URL', 'https://qreekfinance.org')}/pay/{code}?tx_ref={ref}",
+        "subaccounts":    [{"id": link.flutterwave_subaccount_id, "transaction_charge_type": "flat", "transaction_charge": fee}],
+    }
+    if body.pin:
+        card_payload["authorization"] = {"mode": "pin", "pin": body.pin}
+
+    try:
+        encrypted = encrypt_flutterwave_payload(_json.dumps(card_payload))
+        result = await direct_card_charge(encrypted_payload=encrypted)
+    except FlutterwaveAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Card charge failed: {e.message}")
+
+    data      = result.get("data", {})
+    auth_mode = (result.get("meta", {}).get("authorization", {}).get("mode") or "").lower()
+    charge_code = str(data.get("auth_model") or result.get("meta", {}).get("authorization", {}).get("mode") or "")
+    flw_ref   = data.get("flw_ref", "")
+    status_val = str(result.get("status", "")).lower()
+
+    # PIN step-up: Flutterwave tells us to re-submit with pin
+    if auth_mode == "pin" or status_val == "error" and "pin" in result.get("message", "").lower():
+        return {"status": "pin", "tx_ref": ref, "message": result.get("message", "Enter your card PIN.")}
+
+    # OTP step-up
+    if auth_mode == "otp" or status_val == "error" and "otp" in result.get("message", "").lower():
+        return {"status": "otp", "flw_ref": flw_ref, "tx_ref": ref, "message": result.get("message", "Enter the OTP sent to your phone.")}
+
+    # 3DS redirect
+    redirect_url = result.get("meta", {}).get("authorization", {}).get("redirect") or data.get("redirect_url", "")
+    if auth_mode in ("redirect", "3dsecure", "vbvsecurecode") or redirect_url:
+        return {"status": "redirect", "redirect_url": redirect_url, "tx_ref": ref}
+
+    # Immediate success
+    if status_val == "success" or str(data.get("status", "")).lower() == "successful":
+        save_card_for_phone = claims["phone"] if claims else None
+        payment_result = await finalize_flutterwave_link_payment(
+            db, ref, data.get("id"), save_card_for_phone=save_card_for_phone
+        )
+        return {"status": "success", **payment_result}
+
+    raise HTTPException(status_code=502, detail=result.get("message") or "Unexpected card charge response.")
+
+
+@router.post("/pay/{code}/card/validate")
+async def validate_card_direct(
+    code: str,
+    body: CardValidateIn,
+    claims: Optional[dict] = Depends(decode_token_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Submits the OTP from a card direct charge step-up and finalizes payment."""
+    try:
+        result = await validate_charge(otp=body.otp, flw_ref=body.flw_ref)
+    except FlutterwaveAPIError as e:
+        raise HTTPException(status_code=502, detail=f"OTP validation failed: {e.message}")
+
+    data = result.get("data", {})
+    if str(data.get("status", "")).lower() not in ("successful", "completed"):
+        raise HTTPException(status_code=400, detail="OTP validation was not successful. Check the code and try again.")
+
+    save_card_for_phone = claims["phone"] if claims else None
+    payment_result = await finalize_flutterwave_link_payment(
+        db, body.tx_ref, data.get("id"), save_card_for_phone=save_card_for_phone
+    )
+    return {"status": "success", **payment_result}
 
 
 @router.post("/pay/{code}/flutterwave/confirm")

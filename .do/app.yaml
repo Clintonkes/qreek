@@ -1,0 +1,35 @@
+name: qreek-backend
+region: nyc
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    github:
+      repo: Clintonkes/qreek
+      branch: main
+      deploy_on_push: true
+    instance_size_slug: basic-xxs
+    instance_count: 1
+    http_port: 10000
+    envs:
+      - key: DATABASE_URL
+        type: SECRET
+      - key: REDIS_URL
+        type: SECRET
+      - key: QREEK_FEE_ACCOUNT_NUMBER
+        type: SECRET
+      - key: QREEK_FEE_BANK_CODE
+        type: SECRET
+      - key: FLW_PUBLIC_KEY
+        type: SECRET
+      - key: FLW_SECRET_KEY
+        type: SECRET
+      - key: FLW_BASE_URL
+        type: SECRET
+      - key: FLW_SECRET_HASH
+        type: SECRET
+      - key: SMS_PROVIDER
+        type: SECRET
+      - key: BULKSMSNIGERIA_API_TOKEN
+        type: SECRET
+      - key: BULKSMSNIGERIA_SENDER_ID
+        type: SECRET

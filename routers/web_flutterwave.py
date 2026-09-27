@@ -189,7 +189,7 @@ async def finalize_payroll_transfer(db: AsyncSession, tx_ref: str, transaction_i
                         company_name = co.name if co else ""
                     await send_transfer_sms(
                         phone=emp.phone,
-                        message=f"Qreek: ₦{entry.gross_amount:,.0f} has been sent to your bank from {company_name or 'your employer'}. Ref: {entry.reference or tx_ref}.",
+                        message=f"Qreek: NGN {entry.gross_amount:,.0f} has been sent to your bank from {company_name or 'your employer'}. Ref: {entry.reference or tx_ref}.",
                         reference=entry.reference or tx_ref,
                         db=db,
                     )
@@ -394,7 +394,7 @@ async def finalize_payroll_checkout(db: AsyncSession, tx_ref: str, transaction_i
                         if emp and emp.phone:
                             await send_transfer_sms(
                                 phone=emp.phone,
-                                message=f"Qreek: ₦{entry.gross_amount:,.0f} salary for {period_label} from {co_name or 'your employer'} has been sent to your bank. Ref: {ref}.",
+                                message=f"Qreek: NGN {entry.gross_amount:,.0f} salary for {period_label} from {co_name or 'your employer'} has been sent to your bank. Ref: {ref}.",
                                 reference=ref,
                                 db=sess,
                             )

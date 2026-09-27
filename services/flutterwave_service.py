@@ -468,6 +468,81 @@ async def validate_charge(*, otp: str, flw_ref: str) -> dict:
         return response.json()
 
 
+def encrypt_flutterwave_payload(data: str) -> str:
+    """
+    Encrypts a JSON string with 3DES ECB for Flutterwave's Direct Charge API.
+    Key = first 24 bytes of MD5(FLW_SECRET_KEY). Uses PKCS7 padding.
+    The `cryptography` package ships with python-jose[cryptography] already in requirements.
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import padding as sym_padding
+    from cryptography.hazmat.backends import default_backend
+
+    if not FLW_SECRET_KEY:
+        raise FlutterwaveConfigError("FLW_SECRET_KEY not configured.")
+    key = hashlib.md5(FLW_SECRET_KEY.encode()).hexdigest()[:24].encode()
+    padder = sym_padding.PKCS7(64).padder()  # 64-bit block = 3DES block size
+    padded = padder.update(data.encode()) + padder.finalize()
+    cipher = Cipher(algorithms.TripleDES(key), modes.ECB(), backend=default_backend())
+    enc = cipher.encryptor()
+    encrypted = enc.update(padded) + enc.finalize()
+    return base64.b64encode(encrypted).decode()
+
+
+async def direct_card_charge(*, encrypted_payload: str) -> dict:
+    """POST /charges?type=card with a pre-encrypted client payload."""
+    async with _client() as client:
+        response = await client.post(
+            f"{FLW_BASE_URL}/charges?type=card",
+            headers=_headers(),
+            json={"client": encrypted_payload},
+        )
+        logger.info("FW direct card charge: status=%s body=%s", response.status_code, response.text[:600])
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"Card charge failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+        return response.json()
+
+
+async def bank_transfer_charge(*, payload: dict) -> dict:
+    """POST /charges?type=bank_transfer — returns a virtual account the payer transfers to."""
+    async with _client() as client:
+        response = await client.post(
+            f"{FLW_BASE_URL}/charges?type=bank_transfer",
+            headers=_headers(),
+            json=payload,
+        )
+        logger.info("FW bank transfer charge: status=%s body=%s", response.status_code, response.text[:600])
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"Bank transfer charge failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+        return response.json()
+
+
+async def ussd_charge(*, payload: dict) -> dict:
+    """POST /charges?type=ussd — returns a USSD code the payer dials."""
+    async with _client() as client:
+        response = await client.post(
+            f"{FLW_BASE_URL}/charges?type=ussd",
+            headers=_headers(),
+            json=payload,
+        )
+        logger.info("FW ussd charge: status=%s body=%s", response.status_code, response.text[:600])
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"USSD charge failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+        return response.json()
+
+
 def verify_webhook_hash(verif_hash: Optional[str]) -> bool:
     if not FLW_SECRET_HASH:
         logger.error("FLW_SECRET_HASH missing, cannot verify Flutterwave webhook.")

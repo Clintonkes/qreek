@@ -1099,7 +1099,7 @@ async def execute_run(
                         if emp and emp.phone:
                             await send_payout_sms(
                                 phone=emp.phone,
-                                message=f"Qreek: ₦{entry.gross_amount:,.0f} salary for {run.period_label} from {co.name} has been sent to your bank. Ref: {ref}.",
+                                message=f"Qreek: NGN {entry.gross_amount:,.0f} salary for {run.period_label} from {co.name} has been sent to your bank. Ref: {ref}.",
                                 reference=ref,
                                 db=sess,
                             )
@@ -1281,7 +1281,7 @@ async def retry_entry(
         if emp and emp.phone:
             await send_payout_sms(
                 phone=emp.phone,
-                message=f"Qreek: ₦{entry.gross_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
+                message=f"Qreek: NGN {entry.gross_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
                 reference=ref,
                 db=db,
             )
@@ -1357,7 +1357,7 @@ async def retry_all_failed(
                 if emp and emp.phone:
                     await send_payout_sms(
                         phone=emp.phone,
-                        message=f"Qreek: ₦{entry.gross_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
+                        message=f"Qreek: NGN {entry.gross_amount:,.0f} salary retry for {run.period_label} from {co.name} completed. Ref: {ref}.",
                         reference=ref,
                         db=db,
                     )
@@ -1407,7 +1407,7 @@ async def deposit_to_company_wallet(
     if body.amount <= 0:
         raise HTTPException(status_code=400, detail="Deposit amount must be greater than zero.")
     if body.amount > 10_000_000:
-        raise HTTPException(status_code=400, detail="Maximum deposit is ₦10,000,000 per transaction.")
+        raise HTTPException(status_code=400, detail="Maximum deposit is NGN 10,000,000 per transaction.")
 
     ref = "QRK_WAL_" + uuid.uuid4().hex[:10].upper()
     tx  = Transaction(
@@ -1428,7 +1428,7 @@ async def deposit_to_company_wallet(
         customer_name=co.name, customer_phone=phone,
         redirect_url=None,
         title=f"Fund {co.name} wallet",
-        description=f"Deposit ₦{body.amount:,.2f} to {co.name} company wallet",
+        description=f"Deposit NGN {body.amount:,.2f} to {co.name} company wallet",
         metadata={"company_id": co.id, "tx_ref": ref},
     )
 
@@ -1486,7 +1486,7 @@ async def create_payroll_checkout(
         provider_fee = await query_transaction_fee(checkout_base)
         checkout_base = round(run.total_gross + qreek_fee + provider_fee, 2)
     # Same buffer as payment links: 50% uplift on estimated provider fee,
-    # floor of ₦25. Unspent buffer stays in Qreek's Flutterwave merchant balance.
+    # floor of NGN 25. Unspent buffer stays in Qreek's Flutterwave merchant balance.
     buffer = max(round(provider_fee * 0.5, 2), 25.0)
     provider_fee = round(provider_fee + buffer, 2)
     checkout_amount = round(run.total_gross + qreek_fee + provider_fee, 2)
@@ -1513,7 +1513,7 @@ async def create_payroll_checkout(
         customer_name=co.name, customer_phone=phone,
         redirect_url=f"{frontend_url}/enterprise/payroll/{run.id}/checkout/return",
         title=f"Payroll — {run.period_label}",
-        description=f"₦{run.total_gross:,.2f} salaries + ₦{qreek_fee:,.2f} Qreek fee + ₦{provider_fee:,.2f} processing fee — {co.name}",
+        description=f"NGN {run.total_gross:,.2f} salaries + NGN {qreek_fee:,.2f} Qreek fee + NGN {provider_fee:,.2f} processing fee — {co.name}",
         metadata={"company_id": co.id, "run_id": run.id, "tx_ref": ref},
     )
 
