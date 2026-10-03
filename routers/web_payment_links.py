@@ -1702,7 +1702,7 @@ async def init_bank_transfer(
             "meta": {"code": code, "link_id": link.id},
         })
     except FlutterwaveAPIError as e:
-        raise HTTPException(status_code=502, detail=f"Could not initialise bank transfer: {e.message}")
+        raise HTTPException(status_code=502, detail=f"Could not initialise bank transfer: {e}")
 
     data = result.get("data", {})
     meta  = data.get("meta", {})
@@ -1796,7 +1796,7 @@ async def init_ussd(
             "account_bank": body.account_bank,
         })
     except FlutterwaveAPIError as e:
-        raise HTTPException(status_code=502, detail=f"Could not initialise USSD: {e.message}")
+        raise HTTPException(status_code=502, detail=f"Could not initialise USSD: {e}")
 
     data = result.get("data", {})
     auth = data.get("authorization", data.get("meta", {}).get("authorization", {}))
@@ -1911,7 +1911,7 @@ async def charge_card_direct(
         encrypted = encrypt_flutterwave_payload(_json.dumps(card_payload))
         result = await direct_card_charge(encrypted_payload=encrypted)
     except FlutterwaveAPIError as e:
-        raise HTTPException(status_code=502, detail=f"Card charge failed: {e.message}")
+        raise HTTPException(status_code=502, detail=f"Card charge failed: {e}")
 
     data      = result.get("data", {})
     auth_mode = (result.get("meta", {}).get("authorization", {}).get("mode") or "").lower()
@@ -1954,7 +1954,7 @@ async def validate_card_direct(
     try:
         result = await validate_charge(otp=body.otp, flw_ref=body.flw_ref)
     except FlutterwaveAPIError as e:
-        raise HTTPException(status_code=502, detail=f"OTP validation failed: {e.message}")
+        raise HTTPException(status_code=502, detail=f"OTP validation failed: {e}")
 
     data = result.get("data", {})
     if str(data.get("status", "")).lower() not in ("successful", "completed"):

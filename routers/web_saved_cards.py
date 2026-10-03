@@ -158,7 +158,7 @@ async def add_card(
         encrypted = encrypt_flutterwave_payload(_json.dumps(payload))
         result = await direct_card_charge(encrypted_payload=encrypted)
     except FlutterwaveAPIError as e:
-        raise HTTPException(status_code=502, detail=f"Card verification failed: {e.message}")
+        raise HTTPException(status_code=502, detail=f"Card verification failed: {e}")
 
     data      = result.get("data", {})
     auth_mode = (result.get("meta", {}).get("authorization", {}).get("mode") or "").lower()
@@ -195,7 +195,7 @@ async def validate_add_card_otp(
     try:
         result = await validate_charge(otp=body.otp, flw_ref=body.flw_ref)
     except FlutterwaveAPIError as e:
-        raise HTTPException(status_code=502, detail=f"OTP validation failed: {e.message}")
+        raise HTTPException(status_code=502, detail=f"OTP validation failed: {e}")
 
     data = result.get("data", {})
     if str(data.get("status", "")).lower() not in ("successful", "completed"):

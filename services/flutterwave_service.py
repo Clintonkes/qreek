@@ -480,7 +480,8 @@ def encrypt_flutterwave_payload(data: str) -> str:
 
     if not FLW_SECRET_KEY:
         raise FlutterwaveConfigError("FLW_SECRET_KEY not configured.")
-    key = hashlib.md5(FLW_SECRET_KEY.encode()).hexdigest()[:24].encode()
+    # Flutterwave's documented key derivation: first 12 chars of MD5(secret) + last 12 chars of secret
+    key = (hashlib.md5(FLW_SECRET_KEY.encode()).hexdigest()[:12] + FLW_SECRET_KEY[-12:]).encode()
     padder = sym_padding.PKCS7(64).padder()  # 64-bit block = 3DES block size
     padded = padder.update(data.encode()) + padder.finalize()
     cipher = Cipher(algorithms.TripleDES(key), modes.ECB(), backend=default_backend())
