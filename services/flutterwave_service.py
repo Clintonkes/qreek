@@ -474,9 +474,13 @@ def encrypt_flutterwave_payload(data: str) -> str:
     Key = first 24 bytes of MD5(FLW_SECRET_KEY). Uses PKCS7 padding.
     The `cryptography` package ships with python-jose[cryptography] already in requirements.
     """
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers import Cipher, modes
     from cryptography.hazmat.primitives import padding as sym_padding
     from cryptography.hazmat.backends import default_backend
+    try:
+        from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+    except ImportError:
+        from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
 
     if not FLW_SECRET_KEY:
         raise FlutterwaveConfigError("FLW_SECRET_KEY not configured.")
@@ -484,7 +488,7 @@ def encrypt_flutterwave_payload(data: str) -> str:
     key = (hashlib.md5(FLW_SECRET_KEY.encode()).hexdigest()[:12] + FLW_SECRET_KEY[-12:]).encode()
     padder = sym_padding.PKCS7(64).padder()  # 64-bit block = 3DES block size
     padded = padder.update(data.encode()) + padder.finalize()
-    cipher = Cipher(algorithms.TripleDES(key), modes.ECB(), backend=default_backend())
+    cipher = Cipher(TripleDES(key), modes.ECB(), backend=default_backend())
     enc = cipher.encryptor()
     encrypted = enc.update(padded) + enc.finalize()
     return base64.b64encode(encrypted).decode()
