@@ -13,7 +13,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-FLW_SECRET_KEY = os.getenv("FLW_SECRET_KEY")
+FLW_SECRET_KEY = (os.getenv("FLW_SECRET_KEY") or "").strip()
+FLW_ENCRYPTION_KEY = (os.getenv("FLW_ENCRYPTION_KEY") or "").strip()
 FLW_SECRET_HASH = os.getenv("FLW_SECRET_HASH")
 FLW_BASE_URL = os.getenv("FLW_BASE_URL", "https://api.flutterwave.com/v3")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://qreekfinance.org")
@@ -471,8 +472,8 @@ async def validate_charge(*, otp: str, flw_ref: str) -> dict:
 def encrypt_flutterwave_payload(data: str) -> str:
     """
     Encrypts a JSON string with 3DES ECB for Flutterwave's Direct Charge API.
-    Key = first 24 bytes of MD5(FLW_SECRET_KEY). Uses PKCS7 padding.
-    The `cryptography` package ships with python-jose[cryptography] already in requirements.
+    Uses FLW_ENCRYPTION_KEY from the Flutterwave dashboard (Settings → API) if set;
+    falls back to deriving the key: MD5(secret)[:12] + secret[-12:].
     """
     from cryptography.hazmat.primitives.ciphers import Cipher, modes
     from cryptography.hazmat.primitives import padding as sym_padding
@@ -482,11 +483,14 @@ def encrypt_flutterwave_payload(data: str) -> str:
     except ImportError:
         from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
 
-    if not FLW_SECRET_KEY:
-        raise FlutterwaveConfigError("FLW_SECRET_KEY not configured.")
-    # Flutterwave's documented key derivation: first 12 chars of MD5(secret) + last 12 chars of secret
-    key = (hashlib.md5(FLW_SECRET_KEY.encode()).hexdigest()[:12] + FLW_SECRET_KEY[-12:]).encode()
-    padder = sym_padding.PKCS7(64).padder()  # 64-bit block = 3DES block size
+    if FLW_ENCRYPTION_KEY:
+        key = FLW_ENCRYPTION_KEY.encode()
+    elif FLW_SECRET_KEY:
+        key = (hashlib.md5(FLW_SECRET_KEY.encode()).hexdigest()[:12] + FLW_SECRET_KEY[-12:]).encode()
+    else:
+        raise FlutterwaveConfigError("Neither FLW_ENCRYPTION_KEY nor FLW_SECRET_KEY is configured.")
+
+    padder = sym_padding.PKCS7(64).padder()
     padded = padder.update(data.encode()) + padder.finalize()
     cipher = Cipher(TripleDES(key), modes.ECB(), backend=default_backend())
     enc = cipher.encryptor()

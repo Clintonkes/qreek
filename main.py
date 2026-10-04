@@ -159,9 +159,6 @@ async def root():
     return {"message": "Qreek Web API", "version": "1.0.0", "docs": "/docs"}
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    """
-    Health check endpoint to verify the service is running.
-    """
     return {"status": "live", "service": "qreek-web"}
