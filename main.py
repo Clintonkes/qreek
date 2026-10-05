@@ -73,23 +73,20 @@ _SECURITY_HEADERS = {
 
 
 @app.middleware("http")
-async def railway_request_logger(request: Request, call_next):
+async def request_logger(request: Request, call_next):
     started = time.perf_counter()
-    request_id = request.headers.get("x-request-id") or request.headers.get("railway-request-id")
-    log_base = {
-        "event": "http_request",
-        "request_id": request_id,
-        "method": request.method,
-        "path": request.url.path,
-        "query": str(request.url.query)[:500],
-        "client_ip": request.headers.get("x-forwarded-for", request.client.host if request.client else None),
-        "user_agent": request.headers.get("user-agent"),
-    }
+    method = request.method
+    path = request.url.path
+    query = str(request.url.query)
+    target = f"{path}?{query}" if query else path
+    ip_header = request.headers.get("x-forwarded-for", "")
+    client_ip = ip_header.split(",")[0].strip() if ip_header else (request.client.host if request.client else "-")
+
     try:
         response = await call_next(request)
     except Exception:
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-        logger.exception(json.dumps({**log_base, "status_code": 500, "duration_ms": elapsed_ms}))
+        logger.exception("%s %s → 500 (%sms) ip=%s", method, target, elapsed_ms, client_ip)
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal server error. Please try again or contact support."},
@@ -97,13 +94,15 @@ async def railway_request_logger(request: Request, call_next):
         )
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-    log_line = json.dumps({**log_base, "status_code": response.status_code, "duration_ms": elapsed_ms})
-    if response.status_code >= 500:
-        logger.error(log_line)
-    elif response.status_code >= 400:
-        logger.warning(log_line)
+    status = response.status_code
+    log_line = "%s %s → %s (%sms) ip=%s"
+    args = (method, target, status, elapsed_ms, client_ip)
+    if status >= 500:
+        logger.error(log_line, *args)
+    elif status >= 400:
+        logger.warning(log_line, *args)
     else:
-        logger.info(log_line)
+        logger.info(log_line, *args)
 
     for header, value in _SECURITY_HEADERS.items():
         response.headers[header] = value
