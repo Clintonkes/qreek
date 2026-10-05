@@ -1629,12 +1629,53 @@ async def _create_direct_charge_tx(
 
 # ── Bank transfer direct charge ───────────────────────────────────────────────
 
+class BankTransferOtpIn(BaseModel):
+    phone: str
+    name:  str
+
+
 class BankTransferInitIn(BaseModel):
     name:                str
     phone:               str
+    otp:                 str
     amount:              Optional[float] = None
     payment_description: str
     idempotency_key:     Optional[str] = None
+
+
+_BT_OTP_TTL = 600  # 10 minutes
+
+
+@router.post("/pay/{code}/bank-transfer/otp")
+async def request_bank_transfer_otp(
+    code: str,
+    body: BankTransferOtpIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a 6-digit OTP to the payer's phone before generating the virtual bank account."""
+    await _get_live_link(db, code)
+
+    phone = normalise_phone(body.phone.strip())
+    if not phone:
+        raise HTTPException(status_code=400, detail="Valid phone number required.")
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="Name is required.")
+
+    rate_key = f"bt_otp_rate:{code}:{phone}"
+    count = await _redis_call("incr", rate_key, default=0)
+    if count == 1:
+        await _redis_call("expire", rate_key, 900)
+    if int(count) > 5:
+        raise HTTPException(status_code=429, detail="Too many OTP requests. Please wait a few minutes.")
+
+    import random
+    otp = str(random.randint(100000, 999999))
+    await _redis_call("setex", f"bt_otp:{code}:{phone}", _BT_OTP_TTL, otp)
+
+    name = body.name.strip().split()[0]
+    await send_sms(phone, f"Hi {name}, your Qreek payment code is {otp}. It expires in 10 minutes. Do not share it.")
+
+    return {"message": "Code sent to your phone."}
 
 
 @router.post("/pay/{code}/bank-transfer/init")
@@ -1654,9 +1695,14 @@ async def init_bank_transfer(
         raise HTTPException(status_code=502, detail="Link is not ready for payments yet. Edit the bank details and try again.")
 
     payer_name  = body.name.strip()
-    payer_phone = body.phone.strip()
+    payer_phone = normalise_phone(body.phone.strip()) or body.phone.strip()
     if not payer_name or not payer_phone:
         raise HTTPException(status_code=400, detail="Name and phone are required.")
+
+    stored_otp = await _redis_call("get", f"bt_otp:{code}:{payer_phone}")
+    if not stored_otp or stored_otp != (body.otp or "").strip():
+        raise HTTPException(status_code=400, detail="Invalid or expired code. Request a new one.")
+    await _redis_call("delete", f"bt_otp:{code}:{payer_phone}")
 
     recipient_amount = link.amount if not link.is_flexible else body.amount
     if not recipient_amount or recipient_amount < 100:
