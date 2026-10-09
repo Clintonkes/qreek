@@ -552,6 +552,45 @@ async def ussd_charge(*, payload: dict) -> dict:
         return response.json()
 
 
+async def ng_account_charge(*, payload: dict) -> dict:
+    """POST /charges?type=debit_ng_account — directly debits a Nigerian bank account.
+    Payer provides their account number; Flutterwave sends them an OTP (or redirects
+    to internet banking for some banks). Finalize with validate_ng_account_charge.
+    """
+    async with _client() as client:
+        response = await client.post(
+            f"{FLW_BASE_URL}/charges?type=debit_ng_account",
+            headers=_headers(),
+            json=payload,
+        )
+        logger.info("FW ng_account charge: status=%s body=%s", response.status_code, response.text[:800])
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"Account charge failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+        return response.json()
+
+
+async def validate_ng_account_charge(*, otp: str, flw_ref: str) -> dict:
+    """POST /validate-charge with type=account — completes the OTP step-up for a Nigerian account debit."""
+    async with _client() as client:
+        response = await client.post(
+            f"{FLW_BASE_URL}/validate-charge",
+            headers=_headers(),
+            json={"otp": otp, "flw_ref": flw_ref, "type": "account"},
+        )
+        logger.info("FW validate ng_account: flw_ref=%s status=%s body=%s", flw_ref, response.status_code, response.text[:500])
+        if response.is_error:
+            raise FlutterwaveAPIError(
+                f"Account OTP validation failed ({response.status_code})",
+                status_code=response.status_code,
+                response_text=response.text[:1000],
+            )
+        return response.json()
+
+
 def verify_webhook_hash(verif_hash: Optional[str]) -> bool:
     if not FLW_SECRET_HASH:
         logger.error("FLW_SECRET_HASH missing, cannot verify Flutterwave webhook.")

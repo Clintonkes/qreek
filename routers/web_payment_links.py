@@ -52,7 +52,7 @@ from core.web_jwt import decode_token, decode_token_optional, decode_card_checko
 from core.banks import resolve_bank
 from routers.web_auth import _redis_call, normalise_phone
 from services.payment_event_logger import log_payment_event
-from services.flutterwave_service import FlutterwaveAPIError, bank_transfer_charge, charge_with_token, create_collection_subaccount, direct_card_charge, encrypt_flutterwave_payload, find_collection_subaccount, initialize_checkout, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, ussd_charge, validate_charge, verify_transaction, verify_transaction_by_reference
+from services.flutterwave_service import FlutterwaveAPIError, bank_transfer_charge, charge_with_token, create_collection_subaccount, direct_card_charge, encrypt_flutterwave_payload, find_collection_subaccount, initialize_checkout, ng_account_charge, query_transaction_fee, resolve_account, update_subaccount, update_subaccount_split, ussd_charge, validate_charge, validate_ng_account_charge, verify_transaction, verify_transaction_by_reference
 from services.sms_service import send_link_payment_received_sms, send_payment_receipt_sms, send_sms
 
 router = APIRouter(prefix="/api/v1/payment-links", tags=["payment-links"])
@@ -1848,6 +1848,146 @@ async def init_ussd(
         "payment_code": auth.get("transfer_note") or auth.get("payment_code") or auth.get("note") or "",
         "note": auth.get("transfer_note") or auth.get("note") or "",
     }
+
+
+# ── Nigeria Account Direct Debit ──────────────────────────────────────────────
+# Flutterwave debits the payer's Nigerian bank account directly.
+# Payer provides their account number; Flutterwave sends an OTP to their
+# registered phone (or redirects to internet banking for some banks).
+# No need to open a banking app — everything happens on the Qreek page.
+
+class NgAccountInitIn(BaseModel):
+    name:                str
+    phone:               str
+    account_number:      str
+    account_bank:        str
+    amount:              Optional[float] = None
+    payment_description: str
+    idempotency_key:     Optional[str] = None
+
+
+class NgAccountValidateIn(BaseModel):
+    tx_ref:  str
+    flw_ref: str
+    otp:     str
+
+
+@router.post("/pay/{code}/account/init")
+async def init_ng_account_charge(
+    code: str,
+    body: NgAccountInitIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Initiates a Nigerian bank account direct debit via Flutterwave (debit_ng_account).
+    Returns auth_model ('otp' or 'internet_banking'), flw_ref, and tx_ref.
+    For OTP: frontend collects the code and calls /account/validate.
+    For internet_banking: frontend redirects to the returned redirect_url.
+    Split is pre-configured via subaccounts so settlement is automatic.
+    """
+    link = await _get_live_link(db, code)
+    await _ensure_link_subaccount(db, link)
+    if not link.flutterwave_subaccount_id:
+        raise HTTPException(status_code=502, detail="Link is not ready for payments yet. Edit the bank details and try again.")
+
+    payer_name  = body.name.strip()
+    payer_phone = normalise_phone(body.phone.strip()) or body.phone.strip()
+    account_number = body.account_number.strip()
+    account_bank   = body.account_bank.strip()
+    if not payer_name or not payer_phone:
+        raise HTTPException(status_code=400, detail="Name and phone are required.")
+    if not account_number or len(account_number) != 10:
+        raise HTTPException(status_code=400, detail="Enter a valid 10-digit account number.")
+    if not account_bank:
+        raise HTTPException(status_code=400, detail="Select your bank.")
+
+    recipient_amount = link.amount if not link.is_flexible else body.amount
+    if not recipient_amount or recipient_amount < 100:
+        raise HTTPException(status_code=400, detail="Minimum payment is NGN 100.")
+
+    payment_description = (body.payment_description or "").strip()
+    if not payment_description:
+        raise HTTPException(status_code=400, detail="Payment description is required.")
+
+    link_fee_pct = GROUP_FEE_PCT if (link.pool_id or link.family_id) else FEE_PCT
+    checkout_amount, fee, provider_fee_estimate = await _checkout_total_for_recipient(
+        recipient_amount, fee_pct=link_fee_pct
+    )
+
+    ref = "QRK_LNK_" + uuid.uuid4().hex[:10].upper()
+    idempotency_key = body.idempotency_key or f"acct:{code.upper()}:{account_number}:{account_bank}:{recipient_amount}:{payment_description}"
+
+    existing_r = await db.execute(select(Transaction).where(Transaction.idempotency_key == idempotency_key))
+    existing = existing_r.scalar_one_or_none()
+    if existing and existing.status in ("completed", "split_settlement"):
+        return {"already_paid": True, "tx_ref": existing.reference}
+    if existing:
+        ref = existing.reference
+    else:
+        await _create_direct_charge_tx(
+            db, link,
+            payer_name=payer_name, payer_phone=payer_phone,
+            recipient_amount=recipient_amount, checkout_amount=checkout_amount,
+            fee=fee, fee_pct=link_fee_pct, provider_fee_estimate=provider_fee_estimate,
+            payment_description=payment_description, idempotency_key=idempotency_key, ref=ref,
+        )
+
+    try:
+        result = await ng_account_charge(payload={
+            "tx_ref":         ref,
+            "amount":         checkout_amount,
+            "currency":       "NGN",
+            "email":          f"{payer_phone}@qreekfinance.org",
+            "phone_number":   payer_phone,
+            "fullname":       payer_name,
+            "account_bank":   account_bank,
+            "account_number": account_number,
+            "subaccounts":    [{"id": link.flutterwave_subaccount_id, "transaction_charge_type": "flat", "transaction_charge": fee}],
+            "meta":           {"code": code, "link_id": link.id},
+        })
+    except FlutterwaveAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Could not initiate account charge: {e}")
+
+    data     = result.get("data", {})
+    meta_auth = (result.get("meta") or {}).get("authorization") or {}
+    auth_mode = str(data.get("auth_model") or meta_auth.get("mode") or "otp").lower()
+    flw_ref   = data.get("flw_ref") or data.get("id") or ""
+    message   = result.get("message") or "Enter the OTP sent to your phone."
+    redirect_url = meta_auth.get("redirect") or data.get("redirect_url") or ""
+
+    logger.info("ng_account_charge: code=%s ref=%s auth_model=%s", code, ref, auth_mode)
+
+    return {
+        "tx_ref":       ref,
+        "flw_ref":      flw_ref,
+        "auth_model":   auth_mode,
+        "redirect_url": redirect_url,
+        "message":      message,
+        "checkout_amount": checkout_amount,
+    }
+
+
+@router.post("/pay/{code}/account/validate")
+async def validate_ng_account(
+    code: str,
+    body: NgAccountValidateIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Validates the OTP step for a debit_ng_account charge and finalises payment.
+    On success, SMS notifications are sent to both the payer and the link owner.
+    """
+    try:
+        result = await validate_ng_account_charge(otp=body.otp, flw_ref=body.flw_ref)
+    except FlutterwaveAPIError as e:
+        raise HTTPException(status_code=502, detail=f"OTP validation failed: {e}")
+
+    data = result.get("data", {})
+    if str(data.get("status", "")).lower() not in ("successful", "completed"):
+        raise HTTPException(status_code=400, detail="OTP validation was not successful. Check the code and try again.")
+
+    payment_result = await finalize_flutterwave_link_payment(db, body.tx_ref, data.get("id"))
+    return {"status": "success", **payment_result}
 
 
 # ── Card direct charge ────────────────────────────────────────────────────────
