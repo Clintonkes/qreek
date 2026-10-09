@@ -1637,7 +1637,6 @@ class BankTransferOtpIn(BaseModel):
 class BankTransferInitIn(BaseModel):
     name:                str
     phone:               str
-    otp:                 str
     amount:              Optional[float] = None
     payment_description: str
     idempotency_key:     Optional[str] = None
@@ -1698,11 +1697,6 @@ async def init_bank_transfer(
     payer_phone = normalise_phone(body.phone.strip()) or body.phone.strip()
     if not payer_name or not payer_phone:
         raise HTTPException(status_code=400, detail="Name and phone are required.")
-
-    stored_otp = await _redis_call("get", f"bt_otp:{code}:{payer_phone}")
-    if not stored_otp or stored_otp != (body.otp or "").strip():
-        raise HTTPException(status_code=400, detail="Invalid or expired code. Request a new one.")
-    await _redis_call("delete", f"bt_otp:{code}:{payer_phone}")
 
     recipient_amount = link.amount if not link.is_flexible else body.amount
     if not recipient_amount or recipient_amount < 100:
