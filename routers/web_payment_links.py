@@ -1946,9 +1946,15 @@ async def init_ng_account_charge(
             "meta":           {"code": code, "link_id": link.id},
         })
     except FlutterwaveAPIError as e:
+        err_text = str(e).lower()
+        if "not allowed" in err_text or "not supported" in err_text or "not enabled" in err_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Your bank does not support direct account debit. Please use Bank Transfer or USSD instead.",
+            )
         raise HTTPException(status_code=502, detail=f"Could not initiate account charge: {e}")
 
-    data     = result.get("data", {})
+    data     = result.get("data", {}) or {}
     meta_auth = (result.get("meta") or {}).get("authorization") or {}
     auth_mode = str(data.get("auth_model") or meta_auth.get("mode") or "otp").lower()
     flw_ref   = data.get("flw_ref") or data.get("id") or ""
