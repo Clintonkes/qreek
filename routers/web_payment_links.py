@@ -1744,12 +1744,18 @@ async def init_bank_transfer(
     except FlutterwaveAPIError as e:
         raise HTTPException(status_code=502, detail=f"Could not initialise bank transfer: {e}")
 
-    data = result.get("data", {})
-    meta  = data.get("meta", {})
-    authorization = data.get("authorization", {})
-    account_number   = authorization.get("transfer_account") or meta.get("authorization", {}).get("transfer_account", "")
-    account_bank     = authorization.get("transfer_bank") or meta.get("authorization", {}).get("transfer_bank", "")
-    expiry_seconds   = int(authorization.get("transfer_amount_validity") or meta.get("authorization", {}).get("transfer_amount_validity") or 1800)
+    data = result.get("data") or {}
+    # Flutterwave v3 bank_transfer: meta.authorization is at the top-level response, not under data
+    authorization = (
+        (result.get("meta") or {}).get("authorization") or
+        (data.get("meta") or {}).get("authorization") or
+        data.get("authorization") or
+        {}
+    )
+    logger.info("bank_transfer authorization fields: %s", authorization)
+    account_number   = authorization.get("transfer_account", "")
+    account_bank     = authorization.get("transfer_bank", "")
+    expiry_seconds   = int(authorization.get("transfer_amount_validity") or 1800)
 
     return {
         "tx_ref": ref,
@@ -1946,13 +1952,19 @@ async def init_ng_account_charge(
             "meta":           {"code": code, "link_id": link.id},
         })
     except FlutterwaveAPIError as e:
-        err_text = str(e).lower()
-        if "not allowed" in err_text or "not supported" in err_text or "not enabled" in err_text:
+        flw_msg = ""
+        try:
+            flw_msg = json.loads(e.response_text or "").get("message") or ""
+        except Exception:
+            pass
+        err_text = (flw_msg or str(e)).lower()
+        if "not allowed" in err_text or "not supported" in err_text or "not enabled" in err_text or "transaction failed" in err_text:
+            user_msg = flw_msg or "Your bank does not support direct account debit."
             raise HTTPException(
                 status_code=400,
-                detail="Your bank does not support direct account debit. Please use Bank Transfer or USSD instead.",
+                detail=f"{user_msg} Please use Bank Transfer or USSD instead.",
             )
-        raise HTTPException(status_code=502, detail=f"Could not initiate account charge: {e}")
+        raise HTTPException(status_code=502, detail=flw_msg or f"Could not initiate account charge: {e}")
 
     data     = result.get("data", {}) or {}
     meta_auth = (result.get("meta") or {}).get("authorization") or {}
